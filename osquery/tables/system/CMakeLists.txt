@@ -174,6 +174,7 @@ function(generateOsqueryTablesSystemSystemtable)
 
   elseif(DEFINED PLATFORM_WINDOWS)
     list(APPEND source_files
+      windows/amcache.cpp
       windows/appcompat_shims.cpp
       windows/authenticode.cpp
       windows/autoexec.cpp
@@ -205,6 +206,7 @@ function(generateOsqueryTablesSystemSystemtable)
       windows/pipes.cpp
       windows/processes.cpp
       windows/programs.cpp
+      windows/raw_registry.cpp
       windows/registry.cpp
       windows/scheduled_tasks.cpp
       windows/secureboot.cpp

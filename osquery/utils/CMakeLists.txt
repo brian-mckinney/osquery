@@ -54,7 +54,9 @@ function(generateOsqueryUtils)
   if(DEFINED PLATFORM_WINDOWS)
     list(APPEND source_files
       windows/shellitem.cpp
+      windows/raw_registry.cpp
       windows/lzxpress.cpp
+      sleuthkit/sleuthkit.cpp
     )
   endif()
 
@@ -75,6 +77,11 @@ function(generateOsqueryUtils)
     osquery_utils_status
     thirdparty_boost
   )
+    if(DEFINED PLATFORM_WINDOWS)
+      target_link_libraries(osquery_utils PUBLIC
+        thirdparty_sleuthkit
+       )
+    endif()
 
   set(public_header_files
     affixes.h
@@ -102,7 +109,9 @@ function(generateOsqueryUtils)
   if(DEFINED PLATFORM_WINDOWS)
     set(platform_public_header_files
       windows/shellitem.h
+      windows/raw_registry.h
       windows/lzxpress.h
+      sleuthkit/sleuthkit.h
     )
 
     generateIncludeNamespace(osquery_utils "osquery/utils" "FULL_PATH" ${platform_public_header_files})
@@ -172,7 +181,8 @@ function(generateOsqueryUtilsUtilstestsTest)
       tests/windows/env.cpp
       tests/windows/filetime.cpp
       tests/windows/shellitems.cpp
-    )
+      tests/windows/raw_registry.cpp
+      )
   endif()
 
   if(DEFINED PLATFORM_DARWIN)
