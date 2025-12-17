@@ -17,11 +17,8 @@ namespace tables {
 QueryData usersFromContext(const QueryContext& context, bool all) {
   QueryData users;
   if (context.hasConstraint("uid", EQUALS)) {
-    context.iteritems("uid", EQUALS, ([&users](const std::string& expr) {
-                        auto user =
-                            SQL::selectAllFrom("users", "uid", EQUALS, expr);
-                        users.insert(users.end(), user.begin(), user.end());
-                      }));
+    // use selectFrom with the context, so that include_remote is also considered
+    users = SQL::selectFrom("users", "uid", context);
   } else if (!all) {
     users = SQL::selectAllFrom(
         "users", "uid", EQUALS, std::to_string(platformGetUid()));

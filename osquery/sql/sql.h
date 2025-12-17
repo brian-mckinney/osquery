@@ -136,7 +136,18 @@ class SQL : private only_movable {
                               const std::string& column,
                               ConstraintOperator op,
                               const std::string& expr);
-
+  /**
+   * @brief Get columns with constraint, 'SELECT [columns] ... where', results
+   * given a virtual table name, column names, and single constraint.
+   *
+   * @param table The name of the virtual table.
+   * @param column Table column name to apply constraint.
+   * @param ctx The query context.
+   * @return A QueryData object of the 'SELECT [columns] ...' query results.
+   */
+  static QueryData selectFrom(const std::string& table,
+                              const std::string& column,
+                              const QueryContext& ctx);
  protected:
   /**
    * @brief Private default constructor.
