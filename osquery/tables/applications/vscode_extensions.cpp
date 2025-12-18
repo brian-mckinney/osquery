@@ -16,8 +16,10 @@
 #include <osquery/filesystem/filesystem.h>
 #include <osquery/logger/logger.h>
 #include <osquery/tables/system/system_utils.h>
+#include <osquery/tables/system/users.h>
 #include <osquery/utils/json/json.h>
 #include <osquery/sql/sql.h>
+
 
 namespace fs = boost::filesystem;
 
@@ -46,7 +48,7 @@ const std::vector<std::pair<std::string, std::string>> KPathList = {
 void genReadJSONAndAddExtensionRows(const std::string& uid,
                                     const std::string& path,
                                     const std::string& vscode_edition,
-                                    const int include_remote,
+                                    const bool include_remote,
                                     QueryData& results) {
   if (!pathExists(path).ok()) {
     return;
@@ -82,7 +84,7 @@ void genReadJSONAndAddExtensionRows(const std::string& uid,
     Row r;
     r["uid"] = uid;
     r["vscode_edition"] = vscode_edition;
-    r["include_remote"] = std::to_string(include_remote);
+    r["include_remote"] = include_remote ? "1" : "0";
 
     rapidjson::Value::ConstMemberIterator it = identifier.FindMember("id");
     if (it != identifier.MemberEnd() && it->value.IsString()) {
@@ -144,15 +146,13 @@ struct ConfDir {
 
 QueryData genVSCodeExtensions(QueryContext& context) {
   QueryData results;
-  int include_remote = 0;
+  std::set<ConfDir> conf_dirs;
+  bool include_remote = false;
   if (context.hasConstraint("include_remote", EQUALS)) {
-    include_remote = 1;
+    include_remote = context.constraints["include_remote"].matches<int>(1);
   }
 
-  // find vscode config directories
-  std::set<ConfDir> conf_dirs;
-
-  auto users = usersFromContext(context);
+  auto users = genUsers(context);
   for (const auto& row : users) {
     auto uid = row.find("uid");
     auto directory = row.find("directory");
