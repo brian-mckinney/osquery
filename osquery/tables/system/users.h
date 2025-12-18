@@ -22,5 +22,5 @@ namespace tables {
  */
 QueryData genUsers(QueryContext& context);
 
-}
-}
+} // namespace tables
+} // namespace osquery

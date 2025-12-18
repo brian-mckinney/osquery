@@ -154,7 +154,8 @@ QueryData genVSCodeExtensions(QueryContext& context) {
   }
 
   // Call genUsers directly, rather than usersFromContext.  usersFromContext
-  // has no ability to query remote users, as it is limited to a single constraint (uid).
+  // has no ability to query remote users, as it is limited to a single
+  // constraint (uid).
   auto users = genUsers(context);
   for (const auto& row : users) {
     auto uid = row.find("uid");
@@ -173,8 +174,11 @@ QueryData genVSCodeExtensions(QueryContext& context) {
 
   for (const auto& conf_dir : conf_dirs) {
     auto path = conf_dir.path / "extensions" / "extensions.json";
-    genReadJSONAndAddExtensionRows(
-        conf_dir.uid, path.string(), conf_dir.vscode_edition, include_remote, results);
+    genReadJSONAndAddExtensionRows(conf_dir.uid,
+                                   path.string(),
+                                   conf_dir.vscode_edition,
+                                   include_remote,
+                                   results);
   }
 
   return results;
