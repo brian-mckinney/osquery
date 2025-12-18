@@ -104,13 +104,20 @@ QueryData SQL::selectAllFrom(const std::string& table,
   return selectFrom({}, table, column, op, expr);
 }
 
-QueryData SQL::selectFrom(const std::string& table,
+QueryData SQL::selectFrom(const std::initializer_list<std::string>& columns,
+                          const std::string& table,
                           const std::string& column,
-                          const QueryContext& ctx) {
+                          ConstraintOperator op,
+                          const std::string& expr) {
   PluginRequest request = {{"action", "generate"}};
-  
-  // This function assumes that colsUsed is already set in the context.
-
+  // Create a fake content, there will be no caching.
+  QueryContext ctx;
+  ctx.constraints[column].add(Constraint(op, expr));
+  if (columns.size() > 0) {
+    auto colsUsed = UsedColumns(columns);
+    colsUsed.insert(column);
+    ctx.colsUsed = colsUsed;
+  }
   // We can't set colsUsedBitset here (because we don't know the column
   // indexes). The plugin that handles the request will figure it out from the
   // column names.
@@ -122,27 +129,10 @@ QueryData SQL::selectFrom(const std::string& table,
       std::remove_if(response.begin(),
                      response.end(),
                      [&ctx, &column](const PluginRequest& row) -> bool {
-                       return !ctx.constraints.at(column).matches(row.at(column));
+                       return !ctx.constraints[column].matches(row.at(column));
                      }),
       response.end());
   return response;
-}
-
-QueryData SQL::selectFrom(const std::initializer_list<std::string>& columns,
-                          const std::string& table,
-                          const std::string& column,
-                          ConstraintOperator op,
-                          const std::string& expr) {
-  PluginRequest request = {{"action", "generate"}};
-  // Create a fake context and populate it with the constraint and columns used.
-  QueryContext ctx;
-  ctx.constraints[column].add(Constraint(op, expr));
-  if (columns.size() > 0) {
-    auto colsUsed = UsedColumns(columns);
-    colsUsed.insert(column);
-    ctx.colsUsed = colsUsed;
-  }
-  return selectFrom(table, column, ctx);
 }
 
 Status SQLPlugin::call(const PluginRequest& request, PluginResponse& response) {
