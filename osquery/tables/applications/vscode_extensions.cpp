@@ -146,11 +146,16 @@ struct ConfDir {
 QueryData genVSCodeExtensions(QueryContext& context) {
   QueryData results;
   std::set<ConfDir> conf_dirs;
+
+  // We need to know if include_remote is set, because we will need
+  // to include the field in our own results so that it won't be filtered out.
   bool include_remote = false;
   if (context.hasConstraint("include_remote", EQUALS)) {
     include_remote = context.constraints["include_remote"].matches<int>(1);
   }
 
+  // Call genUsers directly, rather than usersFromContext.  usersFromContext
+  // has no ability to query remote users, as it is limited to a single constraint (uid).
   auto users = genUsers(context);
   for (const auto& row : users) {
     auto uid = row.find("uid");
