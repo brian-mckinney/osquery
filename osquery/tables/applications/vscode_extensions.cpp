@@ -19,7 +19,6 @@
 #include <osquery/tables/system/users.h>
 #include <osquery/utils/json/json.h>
 
-
 namespace fs = boost::filesystem;
 
 namespace osquery {
