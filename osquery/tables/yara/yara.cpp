@@ -174,8 +174,8 @@ Status getRuleFromURL(const std::string& url, std::string& rule) {
   return Status::success();
 }
 
-void doYARAScan(YR_RULES* rules,
-                const std::string& path,
+void doYARAScanProcess(YR_RULES* rules,
+                const std::string &pid,
                 QueryData& results,
                 YaraRuleType yr_type,
                 const std::string& sigfile) {
@@ -193,7 +193,7 @@ void doYARAScan(YR_RULES* rules,
   row["pid_with_namespace"] = "0";
 
   // This could use target_path instead to be consistent with yara_events.
-  row["path"] = path;
+  row["pid"] = pid;
 
   switch (yr_type) {
   case YC_GROUP:
@@ -213,8 +213,77 @@ void doYARAScan(YR_RULES* rules,
   }
 
   // Perform the scan, using the static YARA subscriber callback.
+  int result = yr_rules_scan_proc(
+      rules, std::stoi(pid), SCAN_FLAGS_FAST_MODE, YARACallback, (void*)&row, 0);
+  if (result == ERROR_SUCCESS) {
+    results.push_back(std::move(row));
+  }
+}
+
+Row&& makeYaraRow(YaraRuleType yr_type, const std::string& sigfile) {
+  Row row;
+
+  // These are default values, to be updated in YARACallback.
+  row["count"] = INTEGER(0);
+  row["matches"] = SQL_TEXT("");
+  row["strings"] = SQL_TEXT("");
+  row["tags"] = SQL_TEXT("");
+  row["sig_group"] = SQL_TEXT("");
+  row["sigfile"] = SQL_TEXT("");
+  row["sigrule"] = SQL_TEXT("");
+  // This is a default value to be set by namespace handler as appropriate
+  row["pid_with_namespace"] = "0";
+
+  switch (yr_type) {
+  case YC_GROUP:
+    row["sig_group"] = SQL_TEXT(sigfile);
+    break;
+  case YC_FILE:
+    row["sigfile"] = SQL_TEXT(sigfile);
+    break;
+  case YC_RULE:
+    row["sigrule"] = SQL_TEXT(sigfile);
+    break;
+  case YC_URL:
+    row["sigurl"] = SQL_TEXT(sigfile);
+    break;
+  case YC_NONE:
+    break;
+  }
+  return std::move(row);
+}
+
+void doYARAScan(YR_RULES* rules,
+                const std::string& path,
+                QueryData& results,
+                YaraRuleType yr_type,
+                const std::string& sigfile) {
+  Row row = makeYaraRow(yr_type,sigfile);
+
+  // This could use target_path instead to be consistent with yara_events.
+  row["path"] = path;
+
+  // Perform the scan, using the static YARA subscriber callback.
   int result = yr_rules_scan_file(
       rules, path.c_str(), SCAN_FLAGS_FAST_MODE, YARACallback, (void*)&row, 0);
+  if (result == ERROR_SUCCESS) {
+    results.push_back(std::move(row));
+  }
+}
+
+void doYARAScan(YR_RULES* rules,
+                int pid,
+                QueryData& results,
+                YaraRuleType yr_type,
+                const std::string& sigfile) {
+  Row row = makeYaraRow(yr_type, sigfile);
+
+  // This could use target_path instead to be consistent with yara_events.
+  row["pid"] = std::to_string(pid);
+
+  // Perform the scan, using the static YARA subscriber callback.
+  int result = yr_rules_scan_proc(
+      rules, pid, SCAN_FLAGS_FAST_MODE, YARACallback, (void*)&row, 0);
   if (result == ERROR_SUCCESS) {
     results.push_back(std::move(row));
   }
@@ -394,6 +463,8 @@ QueryData genYaraImpl(QueryContext& context, Logger& logger) {
         return status;
       }));
 
+  auto pids = context.constraints["pid"].getAll<int>(EQUALS);
+
   // Scan every path pair with the yara rules
   auto& rules = yaraParser->rules();
   for (const auto& path : paths) {
@@ -402,10 +473,28 @@ QueryData genYaraImpl(QueryContext& context, Logger& logger) {
       auto rules_it = rules.find(hash);
       if (rules_it != rules.end()) {
         doYARAScan(rules_it->second.get(),
-                   path.c_str(),
+                   path,
                    results,
                    sign.first,
                    sign.second);
+
+        // sleep between each file to help smooth out malloc spikes
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(FLAGS_yara_delay));
+      }
+    }
+  }
+
+  for (const auto& pid : pids) {
+    for (const auto& sign : scanContext) {
+      auto hash = hashStr(sign.second, sign.first);
+      auto rules_it = rules.find(hash);
+      if (rules_it != rules.end()) {
+        doYARAScan(rules_it->second.get(),
+                    pid,
+                    results,
+                    sign.first,
+                    sign.second);
 
         // sleep between each file to help smooth out malloc spikes
         std::this_thread::sleep_for(
