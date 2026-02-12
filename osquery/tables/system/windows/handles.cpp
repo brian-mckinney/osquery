@@ -917,6 +917,5 @@ QueryData genHandles(QueryContext& context) {
 
   return results;
 }
-
 } // namespace tables
 } // namespace osquery
