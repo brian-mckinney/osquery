@@ -26,6 +26,7 @@
 #include <osquery/logger/logger.h>
 #include <osquery/remote/uri.h>
 #include <osquery/remote/utility.h>
+#include <osquery/tables/system/windows/token_privileges.h>
 #include <osquery/tables/yara/yara_utils.h>
 #include <osquery/utils/status/status.h>
 #include <osquery/worker/ipc/platform_table_container_ipc.h>
@@ -174,53 +175,7 @@ Status getRuleFromURL(const std::string& url, std::string& rule) {
   return Status::success();
 }
 
-void doYARAScanProcess(YR_RULES* rules,
-                const std::string &pid,
-                QueryData& results,
-                YaraRuleType yr_type,
-                const std::string& sigfile) {
-  Row row;
-
-  // These are default values, to be updated in YARACallback.
-  row["count"] = INTEGER(0);
-  row["matches"] = SQL_TEXT("");
-  row["strings"] = SQL_TEXT("");
-  row["tags"] = SQL_TEXT("");
-  row["sig_group"] = SQL_TEXT("");
-  row["sigfile"] = SQL_TEXT("");
-  row["sigrule"] = SQL_TEXT("");
-  // This is a default value to be set by namespace handler as appropriate
-  row["pid_with_namespace"] = "0";
-
-  // This could use target_path instead to be consistent with yara_events.
-  row["pid"] = pid;
-
-  switch (yr_type) {
-  case YC_GROUP:
-    row["sig_group"] = SQL_TEXT(sigfile);
-    break;
-  case YC_FILE:
-    row["sigfile"] = SQL_TEXT(sigfile);
-    break;
-  case YC_RULE:
-    row["sigrule"] = SQL_TEXT(sigfile);
-    break;
-  case YC_URL:
-    row["sigurl"] = SQL_TEXT(sigfile);
-    break;
-  case YC_NONE:
-    break;
-  }
-
-  // Perform the scan, using the static YARA subscriber callback.
-  int result = yr_rules_scan_proc(
-      rules, std::stoi(pid), SCAN_FLAGS_FAST_MODE, YARACallback, (void*)&row, 0);
-  if (result == ERROR_SUCCESS) {
-    results.push_back(std::move(row));
-  }
-}
-
-Row&& makeYaraRow(YaraRuleType yr_type, const std::string& sigfile) {
+Row makeYaraRow(YaraRuleType yr_type, const std::string& sigfile) {
   Row row;
 
   // These are default values, to be updated in YARACallback.
@@ -250,7 +205,7 @@ Row&& makeYaraRow(YaraRuleType yr_type, const std::string& sigfile) {
   case YC_NONE:
     break;
   }
-  return std::move(row);
+  return row;
 }
 
 void doYARAScan(YR_RULES* rules,
@@ -463,10 +418,13 @@ QueryData genYaraImpl(QueryContext& context, Logger& logger) {
         return status;
       }));
 
+  // Get all pids specified
   auto pids = context.constraints["pid"].getAll<int>(EQUALS);
 
   // Scan every path pair with the yara rules
   auto& rules = yaraParser->rules();
+
+  // Scan files
   for (const auto& path : paths) {
     for (const auto& sign : scanContext) {
       auto hash = hashStr(sign.second, sign.first);
@@ -485,6 +443,21 @@ QueryData genYaraImpl(QueryContext& context, Logger& logger) {
     }
   }
 
+  // Enabling debug token privilege is required for scanning processes that are
+  // not owned by the current user. We will attempt to enable the privilege
+  // before scanning and reset it back to the original state after scanning.
+  SeDebugPrivState original_priv_state = getDebugTokenPrivilegeState();
+  bool reset_priv_after_scan = false;
+  if (original_priv_state != SeDebugPrivState::Enabled) {
+    if (!setDebugTokenPrivilege(SeDebugPrivState::Enabled)) {
+      LOG(WARNING) << "Failed to set debug token privilege for process scan";
+    } else {
+      LOG(INFO) << "Debug token privilege enabled for process scan";
+      reset_priv_after_scan = true;
+    }
+  }
+
+  // Scan processes
   for (const auto& pid : pids) {
     for (const auto& sign : scanContext) {
       auto hash = hashStr(sign.second, sign.first);
@@ -500,6 +473,17 @@ QueryData genYaraImpl(QueryContext& context, Logger& logger) {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(FLAGS_yara_delay));
       }
+    }
+  }
+
+  // Reset debug token privilege to original state if it was changed for the
+  // scan
+  if (reset_priv_after_scan) {
+    if (!setDebugTokenPrivilege(original_priv_state)) {
+      LOG(WARNING)
+          << "Failed to reset debug token privilege after process scan";
+    } else {
+      LOG(INFO) << "Debug token privilege reset after process scan";
     }
   }
 
