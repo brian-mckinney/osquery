@@ -11,7 +11,6 @@
 #include <string>
 
 #include <cerrno>
-#include <charconv>
 #include <sys/stat.h>
 
 #include <osquery/config/config.h>
@@ -343,66 +342,43 @@ int YARACallback(YR_SCAN_CONTEXT* context,
                  int message,
                  void* message_data,
                  void* user_data) {
+  if (message == CALLBACK_MSG_RULE_MATCHING) {
+    Row* r = (Row*)user_data;
+    YR_RULE* rule = (YR_RULE*)message_data;
 
-  if (message != CALLBACK_MSG_RULE_MATCHING) {
-    return CALLBACK_CONTINUE;
-  }
-
-  // Return an error if the callback is called without user data or message data, as
-  // this should never happen.
-  if (user_data == nullptr) {
-    VLOG(1) << "YARA callback called with no user data";
-    return CALLBACK_ERROR;
-  }
-  if (message_data == nullptr) {
-    VLOG(1) << "YARA callback called with no message data";
-    return CALLBACK_ERROR;
-  }
-
-  // We know that user_data and message_data are valid pointers
-  // and that the message is CALLBACK_MSG_RULE_MATCHING, so we can safely cast them.
-  Row& row = *static_cast<Row*>(user_data);
-  YR_RULE* rule = static_cast<YR_RULE*>(message_data);
-
-  // Helper lambda to append a value to a comma-separated list in the row
-  auto appendStringValue = [&row](const std::string& key, const std::string& value) {
-    if (row[key].length() > 0) {
-      row[key] += "," + value;
+    if ((*r)["matches"].length() > 0) {
+      (*r)["matches"] += "," + std::string(rule->identifier);
     } else {
-      row[key] = value;
+      (*r)["matches"] = std::string(rule->identifier);
     }
-  };
 
-  // Add the rule identifier to the "matches" column, prefixed by the namespace
-  // if it exists and is not the implicit "default" namespace.
-  if (rule->ns && rule->ns->name &&
-      std::string_view(rule->ns->name) != "default") {
-    appendStringValue("matches", std::string(rule->ns->name) + "::" + std::string(rule->identifier));
-  } else {
-    appendStringValue("matches", std::string(rule->identifier));
-  }
+    YR_STRING* string = nullptr;
+    yr_rule_strings_foreach(rule, string) {
+      YR_MATCH* match = nullptr;
+      yr_string_matches_foreach(context, string, match) {
+        if ((*r)["strings"].length() > 0) {
+          (*r)["strings"] += "," + std::string(string->identifier);
+        } else {
+          (*r)["strings"] = std::string(string->identifier);
+        }
 
-  YR_STRING* string = nullptr;
-  yr_rule_strings_foreach(rule, string) {
-    YR_MATCH* match = nullptr;
-    yr_string_matches_foreach(context, string, match) {
-      appendStringValue("strings", std::string(string->identifier));
-
-      // use std::to_chars to convert the match offset to a string,
-      // as it is much faster than std::stringstream
-      char buf[17] = {};
-      auto [ptr, ec] = std::to_chars(
-          buf, buf + sizeof(buf), match->base + match->offset, 16);
-      row["strings"] += ":" + std::string(buf, ptr);
+        std::stringstream ss;
+        ss << std::hex << (match->base + match->offset);
+        (*r)["strings"] += ":" + ss.str();
+      }
     }
-  }
 
-  const char* tag = nullptr;
-  yr_rule_tags_foreach(rule, tag) {
-    appendStringValue("tags", std::string(tag));
-  }
+    const char* tag = nullptr;
+    yr_rule_tags_foreach(rule, tag) {
+      if ((*r)["tags"].length() > 0) {
+        (*r)["tags"] += "," + std::string(tag);
+      } else {
+        (*r)["tags"] = std::string(tag);
+      }
+    }
 
-  row["count"] = INTEGER(std::stoi(row["count"]) + 1);
+    (*r)["count"] = INTEGER(std::stoi((*r)["count"]) + 1);
+  }
 
   return CALLBACK_CONTINUE;
 }

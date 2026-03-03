@@ -69,7 +69,7 @@ HIDDEN_FLAG(bool,
 namespace tables {
 
 using YaraRuleSet = std::set<std::string>;
-
+typedef enum { YC_NONE = 0, YC_GROUP, YC_FILE, YC_RULE, YC_URL } YaraRuleType;
 using YARAConfigParser = std::shared_ptr<YARAConfigParserPlugin>;
 
 using YaraScanContext = std::set<std::pair<YaraRuleType, std::string>>;
@@ -108,10 +108,10 @@ static YARAConfigParser getYaraParser(void) {
   return yaraParser;
 }
 
+// Create an empty Row to be filled in by the YARA callback
 static Row makeYaraRow(YaraRuleType yr_type, const std::string& sigName) {
   Row row;
 
-  // These are default values, to be updated in YARACallback.
   row["count"] = INTEGER(0);
   row["matches"] = SQL_TEXT("");
   row["strings"] = SQL_TEXT("");
@@ -206,12 +206,13 @@ Status getRuleFromURL(const std::string& url, std::string& rule) {
   return Status::success();
 }
 
+// Scan file by path
 void doYARAScan(YR_RULES* rules,
                 const std::string& path,
                 QueryData& results,
                 YaraRuleType yr_type,
                 const std::string& sigfile) {
-  Row row = makeYaraRow(yr_type,sigfile);
+  Row row = makeYaraRow(yr_type, sigfile);
 
   // This could use target_path instead to be consistent with yara_events.
   row["path"] = path;
@@ -224,14 +225,13 @@ void doYARAScan(YR_RULES* rules,
   }
 }
 
+// Scan process memory by pid
 void doYARAScan(YR_RULES* rules,
                 int pid,
                 QueryData& results,
                 YaraRuleType yr_type,
                 const std::string& sigfile) {
   Row row = makeYaraRow(yr_type, sigfile);
-
-  // This could use target_path instead to be consistent with yara_events.
   row["pid"] = std::to_string(pid);
 
   // Perform the scan, using the static YARA subscriber callback.
@@ -416,9 +416,6 @@ QueryData genYaraImpl(QueryContext& context, Logger& logger) {
         return status;
       }));
 
-  // Get all pids specified
-  auto pids = context.constraints["pid"].getAll<int>(EQUALS);
-
   // Scan every path pair with the yara rules
   auto& rules = yaraParser->rules();
 
@@ -429,7 +426,7 @@ QueryData genYaraImpl(QueryContext& context, Logger& logger) {
       auto rules_it = rules.find(hash);
       if (rules_it != rules.end()) {
         doYARAScan(rules_it->second.get(),
-                   path,
+                   path.c_str(),
                    results,
                    sign.first,
                    sign.second);
@@ -441,47 +438,51 @@ QueryData genYaraImpl(QueryContext& context, Logger& logger) {
     }
   }
 
-  // Enabling debug token privilege is required for scanning processes that are
-  // not owned by the current user. We will attempt to enable the privilege
-  // before scanning and reset it back to the original state after scanning.
-  SeDebugPrivState original_priv_state = getDebugTokenPrivilegeState();
-  bool reset_priv_after_scan = false;
-  if (original_priv_state != SeDebugPrivState::Enabled) {
-    if (!setDebugTokenPrivilege(SeDebugPrivState::Enabled)) {
-      LOG(WARNING) << "Failed to set debug token privilege for process scan";
-    } else {
-      LOG(INFO) << "Debug token privilege enabled for process scan";
-      reset_priv_after_scan = true;
-    }
-  }
+  // Get all pids specified
+  auto pids = context.constraints["pid"].getAll<int>(EQUALS);
 
-  // Scan processes
-  for (const auto& pid : pids) {
-    for (const auto& sign : scanContext) {
-      auto hash = hashStr(sign.second, sign.first);
-      auto rules_it = rules.find(hash);
-      if (rules_it != rules.end()) {
-        doYARAScan(rules_it->second.get(),
-                    pid,
-                    results,
-                    sign.first,
-                    sign.second);
-
-        // sleep between each file to help smooth out malloc spikes
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(FLAGS_yara_delay));
+  // Scan process memory if pid or pids are specified
+  if (!pids.empty()) {
+    // Enabling debug token privilege is required for scanning processes that
+    // are not owned by the current user. We will attempt to enable the
+    // privilege before scanning and reset it back to the original state after
+    // scanning.
+    SeDebugPrivState original_priv_state = getDebugTokenPrivilegeState();
+    bool reset_priv_after_scan = false;
+    if (original_priv_state != SeDebugPrivState::Enabled) {
+      if (!setDebugTokenPrivilege(SeDebugPrivState::Enabled)) {
+        LOG(WARNING) << "Failed to set debug token privilege for process scan";
+      } else {
+        LOG(INFO) << "Debug token privilege enabled for process scan";
+        reset_priv_after_scan = true;
       }
     }
-  }
 
-  // Reset debug token privilege to original state if it was changed for the
-  // scan
-  if (reset_priv_after_scan) {
-    if (!setDebugTokenPrivilege(original_priv_state)) {
-      LOG(WARNING)
-          << "Failed to reset debug token privilege after process scan";
-    } else {
-      LOG(INFO) << "Debug token privilege reset after process scan";
+    // Scan processes
+    for (const auto& pid : pids) {
+      for (const auto& sign : scanContext) {
+        auto hash = hashStr(sign.second, sign.first);
+        auto rules_it = rules.find(hash);
+        if (rules_it != rules.end()) {
+          doYARAScan(
+              rules_it->second.get(), pid, results, sign.first, sign.second);
+
+          // sleep between each file to help smooth out malloc spikes
+          std::this_thread::sleep_for(
+              std::chrono::milliseconds(FLAGS_yara_delay));
+        }
+      }
+    }
+
+    // Reset debug token privilege to original state if it was changed for the
+    // scan
+    if (reset_priv_after_scan) {
+      if (!setDebugTokenPrivilege(original_priv_state)) {
+        LOG(WARNING)
+            << "Failed to reset debug token privilege after process scan";
+      } else {
+        LOG(INFO) << "Debug token privilege reset after process scan";
+      }
     }
   }
 

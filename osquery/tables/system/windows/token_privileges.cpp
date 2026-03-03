@@ -6,8 +6,6 @@
  *
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
-
-#include <osquery/core/windows/wmi.h>
 #include <osquery/logger/logger.h>
 #include <osquery/tables/system/windows/token_privileges.h>
 
