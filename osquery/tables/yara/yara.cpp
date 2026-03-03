@@ -70,8 +70,6 @@ namespace tables {
 
 using YaraRuleSet = std::set<std::string>;
 
-typedef enum { YC_NONE = 0, YC_GROUP, YC_FILE, YC_RULE, YC_URL } YaraRuleType;
-
 using YARAConfigParser = std::shared_ptr<YARAConfigParserPlugin>;
 
 using YaraScanContext = std::set<std::pair<YaraRuleType, std::string>>;
@@ -108,6 +106,39 @@ static YARAConfigParser getYaraParser(void) {
   }
 
   return yaraParser;
+}
+
+static Row makeYaraRow(YaraRuleType yr_type, const std::string& sigName) {
+  Row row;
+
+  // These are default values, to be updated in YARACallback.
+  row["count"] = INTEGER(0);
+  row["matches"] = SQL_TEXT("");
+  row["strings"] = SQL_TEXT("");
+  row["tags"] = SQL_TEXT("");
+  row["sig_group"] = SQL_TEXT("");
+  row["sigfile"] = SQL_TEXT("");
+  row["sigrule"] = SQL_TEXT("");
+  // This is a default value to be set by namespace handler as appropriate
+  row["pid_with_namespace"] = "0";
+
+  switch (yr_type) {
+  case YC_GROUP:
+    row["sig_group"] = SQL_TEXT(sigName);
+    break;
+  case YC_FILE:
+    row["sigfile"] = SQL_TEXT(sigName);
+    break;
+  case YC_RULE:
+    row["sigrule"] = SQL_TEXT(sigName);
+    break;
+  case YC_URL:
+    row["sigurl"] = SQL_TEXT(sigName);
+    break;
+  case YC_NONE:
+    break;
+  }
+  return row;
 }
 
 bool isRuleUrlAllowed(std::set<std::string> signature_set, std::string url) {
@@ -173,39 +204,6 @@ Status getRuleFromURL(const std::string& url, std::string& rule) {
   }
 
   return Status::success();
-}
-
-Row makeYaraRow(YaraRuleType yr_type, const std::string& sigfile) {
-  Row row;
-
-  // These are default values, to be updated in YARACallback.
-  row["count"] = INTEGER(0);
-  row["matches"] = SQL_TEXT("");
-  row["strings"] = SQL_TEXT("");
-  row["tags"] = SQL_TEXT("");
-  row["sig_group"] = SQL_TEXT("");
-  row["sigfile"] = SQL_TEXT("");
-  row["sigrule"] = SQL_TEXT("");
-  // This is a default value to be set by namespace handler as appropriate
-  row["pid_with_namespace"] = "0";
-
-  switch (yr_type) {
-  case YC_GROUP:
-    row["sig_group"] = SQL_TEXT(sigfile);
-    break;
-  case YC_FILE:
-    row["sigfile"] = SQL_TEXT(sigfile);
-    break;
-  case YC_RULE:
-    row["sigrule"] = SQL_TEXT(sigfile);
-    break;
-  case YC_URL:
-    row["sigurl"] = SQL_TEXT(sigfile);
-    break;
-  case YC_NONE:
-    break;
-  }
-  return row;
 }
 
 void doYARAScan(YR_RULES* rules,
