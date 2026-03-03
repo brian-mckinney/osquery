@@ -13,10 +13,13 @@
 namespace osquery {
 namespace tables {
 
+// The state of the SeDebugPrivilege for a token.
 enum class SeDebugPrivState { Enabled, Disabled };
 
+// Get the state of the SeDebugPrivilege for the current process token.
 SeDebugPrivState getDebugTokenPrivilegeState();
 
+// Enable or disable the SeDebugPrivilege for the current process token based on
 bool setDebugTokenPrivilege(SeDebugPrivState state);
 
 } // namespace tables

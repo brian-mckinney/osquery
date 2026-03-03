@@ -12,6 +12,7 @@
 namespace osquery {
 namespace tables {
 
+// Simple RAII wrapper to ensure handles are closed.
 struct HandleCloser {
   HANDLE& handle;
   HandleCloser(HANDLE& h) : handle(h) {}
@@ -68,7 +69,7 @@ bool setDebugTokenPrivilege(SeDebugPrivState state) {
   TOKEN_PRIVILEGES tp = {0};
   LUID val = {0};
 
-  LOG(INFO) << "Attempting to set debug token privilege for process scan";
+  LOG(DEBUG) << "Attempting to set debug token privilege for process scan";
   if (!OpenProcessToken(GetCurrentProcess(),
                         TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
                         &hToken)) {
@@ -97,7 +98,7 @@ bool setDebugTokenPrivilege(SeDebugPrivState state) {
     return false;
   }
 
-  LOG(INFO) << "Successfully set debug token privilege for process scan";
+  LOG(DEBUG) << "Successfully set debug token privilege for process scan";
   return true;
 }
 
