@@ -59,6 +59,10 @@ constexpr size_t MAXIMUM_ENUMERATION_BUFFER_SIZE = 1024 * 1024 * 1024; // 1GB
 #define ObjectAllTypesInformation ((OBJECT_INFORMATION_CLASS)3)
 #endif
 
+#ifndef MemoryMappedFilenameInformation
+#define MemoryMappedFilenameInformation 2
+#endif
+
 #ifndef STATUS_UNSUCCESSFUL
 #define STATUS_UNSUCCESSFUL 0xC0000001L
 #endif
@@ -79,9 +83,18 @@ constexpr size_t MAXIMUM_ENUMERATION_BUFFER_SIZE = 1024 * 1024 * 1024; // 1GB
 #define STATUS_NOT_SUPPORTED 0xC00000BBL
 #endif
 
+#ifndef STATUS_INVALID_HANDLE
+#define STATUS_INVALID_HANDLE 0xC0000008L
+#endif
+
 #ifndef STATUS_RETRY
 #define STATUS_RETRY 0xC000022DL
 #endif
+
+#ifndef THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH
+#define THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH 0x00000002
+#endif
+
 
 constexpr size_t AlignUp(size_t value, size_t align) {
   return (value + (align - 1)) & ~(align - 1);
@@ -187,6 +200,47 @@ extern "C" LONG NTAPI RtlCompareUnicodeString(PCUNICODE_STRING String1,
 
 extern "C" NTSTATUS NTAPI RtlGetVersion(PRTL_OSVERSIONINFOW lpVersionInformation);
 
+extern "C" NTSTATUS NTAPI NtCreateThreadEx(PHANDLE ThreadHandle,
+                                           ACCESS_MASK DesiredAccess,
+                                           PVOID ObjectAttributes,
+                                           HANDLE ProcessHandle,
+                                           PVOID StartRoutine,
+                                           PVOID Argument,
+                                           ULONG CreateFlags,
+                                           SIZE_T ZeroBits,
+                                           SIZE_T StackSize,
+                                           SIZE_T MaximumStackSize,
+                                           PVOID AttributeList);
+
+extern "C" NTSTATUS NTAPI NtCreateSection(PHANDLE SectionHandle,
+                                          ACCESS_MASK DesiredAccess,
+                                          PVOID ObjectAttributes,
+                                          PLARGE_INTEGER MaximumSize,
+                                          ULONG SectionPageProtection,
+                                          ULONG AllocationAttributes,
+                                          HANDLE FileHandle);
+
+extern "C" NTSTATUS NTAPI NtMapViewOfSection(HANDLE SectionHandle,
+                                             HANDLE ProcessHandle,
+                                             PVOID* BaseAddress,
+                                             ULONG_PTR ZeroBits,
+                                             SIZE_T CommitSize,
+                                             PLARGE_INTEGER SectionOffset,
+                                             PSIZE_T ViewSize,
+                                             ULONG InheritDisposition,
+                                             ULONG AllocationType,
+                                             ULONG Win32Protect);
+
+extern "C" NTSTATUS NTAPI NtUnmapViewOfSection(HANDLE ProcessHandle,
+                                               PVOID BaseAddress);
+
+extern "C" NTSTATUS NTAPI NtQueryVirtualMemory(HANDLE ProcessHandle,
+                                               PVOID BaseAddress,
+                                               ULONG MemoryInformationClass,
+                                               PVOID MemoryInformation,
+                                               SIZE_T MemoryInformationLength,
+                                               PSIZE_T ReturnLength);
+
 enum class ErrorStage {
   None = 0,
   ProcessOpening = 1,
@@ -194,6 +248,12 @@ enum class ErrorStage {
   ObjectBasicInfoQuerying = 3,
   ObjectTypeInfoQuerying = 4,
   ObjectNameQuerying = 5
+};
+
+enum class MappingTechniqueResult {
+  Success,
+  FailedInvalidHandle,
+  FailedOther
 };
 
 std::string_view ErrorStageString(ErrorStage stage) {
@@ -878,8 +938,50 @@ GetHandleAndTypeEnumeration(HandleEnumeration& handleEnum) {
   return STATUS_SUCCESS;
 }
 
+// Attempt to resolve a File object's name by creating a section, mapping a
+// view, and querying the mapped filename.  On success the result is written
+// directly into params.nameBuffer / params.ntStatus so the caller's existing
+// result-handling logic works unchanged.
+MappingTechniqueResult
+GetFileObjectNameViaMappingTechnique(HANDLE hFile, QUERY_OBJECT_NAME_PARAMS& params) {
+  HANDLE hSection = NULL;
+  PVOID pBaseAddress = NULL;
+  SIZE_T viewSize = 1;
+  NTSTATUS ntStatus;
+
+  ntStatus = NtCreateSection(
+      &hSection, SECTION_MAP_READ | SECTION_QUERY, NULL, NULL, PAGE_READONLY, SEC_COMMIT, hFile);
+  if (!NT_SUCCESS(ntStatus)) {
+    if (STATUS_INVALID_HANDLE == ntStatus) {
+      return MappingTechniqueResult::FailedInvalidHandle;
+    }
+    return MappingTechniqueResult::FailedOther;
+  }
+
+  ntStatus = NtMapViewOfSection(
+      hSection, GetCurrentProcess(), &pBaseAddress, 0, 0, NULL, &viewSize, 2 /* ViewUnmap */, 0, PAGE_READONLY);
+  CloseHandle(hSection);
+  if (!NT_SUCCESS(ntStatus)) {
+    return MappingTechniqueResult::FailedOther;
+  }
+
+  SIZE_T retLen = 0;
+  params.ntStatus = NtQueryVirtualMemory(
+      GetCurrentProcess(), pBaseAddress, MemoryMappedFilenameInformation, &params.nameBuffer,
+      sizeof(params.nameBuffer), &retLen);
+
+  // Regardless of whether the Query succeeded or not, we need to unmap the view of the section.
+  NtUnmapViewOfSection(GetCurrentProcess(), pBaseAddress);
+
+  if (!NT_SUCCESS(params.ntStatus)) {
+    return MappingTechniqueResult::FailedOther;
+  }
+
+  return MappingTechniqueResult::Success;
+}
+
 DWORD
-EnumerateAllHandles(const std::set<int>& pidlist, HandleEnumeration& handleEnumeration) {
+EnumerateAllHandles(const std::set<int>& pidlist, HandleEnumeration& handleEnumeration, bool bUseBlockableThreads) {
   NTSTATUS ntStatus = STATUS_SUCCESS;
   UNICODE_STRING fileTypeName = {0};
   std::set<ULONG_PTR> accessDeniedPIDs;
@@ -1000,40 +1102,55 @@ EnumerateAllHandles(const std::set<int>& pidlist, HandleEnumeration& handleEnume
           params.ntStatus = STATUS_UNSUCCESSFUL;
 
           // For File object types the NtQueryObject call could block
-          // indefinitely (sync consoles, pipes, etc.) As such we make the call
-          // in a thread and potentially time it out.
+          // indefinitely (sync consoles, pipes, etc.)  We first attempt the
+          // non-blocking mapping technique (section + mapped filename query).
+          // If the mapping technique fails and the caller opted in via
+          // bUseBlockableThreads, we fall back to a thread with a timeout.
           if (0 == RtlCompareUnicodeString(&objTypeInfo.TypeInfo.TypeName, &fileTypeName, FALSE)) {
-            HANDLE hThread = NULL;
+            MappingTechniqueResult mappingResult =
+                GetFileObjectNameViaMappingTechnique(duplicatedObjectHandle, params);
 
-            hThread = CreateThread(NULL, 0, QueryObjectNameThreadFunc, &params, 0, NULL);
-            if (NULL == hThread) {
-              handleIter->SetError(ErrorStage::ObjectNameQuerying, GetLastError());
-            } else {
-              switch (WaitForSingleObject(hThread, 500)) {
-              case WAIT_OBJECT_0:
-                // Thread completed, we check results below
-                bThreadWaitSatisfied = true;
-                break;
-              case WAIT_TIMEOUT:
-                handleIter->SetError(ErrorStage::ObjectNameQuerying, ERROR_TIMEOUT, true);
-                LOG(ERROR) << "Querying object timed out for PID: " << handleIter->Pid() << " | Handle : 0x" << std::hex
-                           << handleIter->Handle() << std::dec;
-                break;
-              default:
-                DWORD lastError = GetLastError();
-                handleIter->SetError(ErrorStage::ObjectNameQuerying, lastError, true);
-                LOG(ERROR) << "Error waiting for thread for PID: " << handleIter->Pid() << " | Handle : 0x" << std::hex
-                           << handleIter->Handle() << std::dec << " | Error: " << lastError;
-                break;
+            if (MappingTechniqueResult::Success != mappingResult) {
+              if (MappingTechniqueResult::FailedInvalidHandle == mappingResult) {
+                params.ntStatus = STATUS_INVALID_HANDLE;
+              } else if (bUseBlockableThreads) {
+                HANDLE hThread = NULL;
+
+                NTSTATUS ntThreadStatus = NtCreateThreadEx(
+                    &hThread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(), (PVOID)QueryObjectNameThreadFunc, &params,
+                    THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH, 0, 0, 0, NULL);
+                if (!NT_SUCCESS(ntThreadStatus) || NULL == hThread) {
+                  handleIter->SetError(ErrorStage::ObjectNameQuerying,
+                                       NT_SUCCESS(ntThreadStatus) ? GetLastError()
+                                                                  : RtlNtStatusToDosError(ntThreadStatus));
+                } else {
+                  switch (WaitForSingleObject(hThread, 500)) {
+                  case WAIT_OBJECT_0:
+                    bThreadWaitSatisfied = true;
+                    break;
+                  case WAIT_TIMEOUT:
+                    handleIter->SetError(ErrorStage::ObjectNameQuerying, ERROR_TIMEOUT, true);
+                    LOG(ERROR) << "Querying object timed out for PID: " << handleIter->Pid()
+                               << " | Handle : 0x" << std::hex << handleIter->Handle() << std::dec;
+                    break;
+                  default:
+                    DWORD lastError = GetLastError();
+                    handleIter->SetError(ErrorStage::ObjectNameQuerying, lastError, true);
+                    LOG(ERROR) << "Error waiting for thread for PID: " << handleIter->Pid()
+                               << " | Handle : 0x" << std::hex << handleIter->Handle() << std::dec
+                               << " | Error: " << lastError;
+                    break;
+                  }
+
+                  if (!bThreadWaitSatisfied) {
+                    // Cancel the thread and guarantee it's terminated
+                    TerminateThread(hThread, ERROR_CANCELLED);
+                    WaitForSingleObject(hThread, INFINITE);
+                  }
+
+                  CloseHandle(hThread);
+                }
               }
-
-              if (!bThreadWaitSatisfied) {
-                // Cancel the thread and guarantee it's terminated
-                TerminateThread(hThread, ERROR_CANCELLED);
-                WaitForSingleObject(hThread, INFINITE);
-              }
-
-              CloseHandle(hThread);
             }
           }
           // Not a File object, this query can't block and we don't need a
@@ -1107,7 +1224,7 @@ QueryData genHandles(QueryContext& context) {
     return results;
   }
 
-  if (ERROR_SUCCESS != handles::EnumerateAllHandles(pidlist, handleEnumeration)) {
+  if (ERROR_SUCCESS != handles::EnumerateAllHandles(pidlist, handleEnumeration, false)) {
     LOG(ERROR) << "Failed to enumerate all handles.";
     return results;
   }
