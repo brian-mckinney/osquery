@@ -7,95 +7,53 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 #include <windows.h>
-#include <winternl.h>
 
 #include <iomanip>
-#include <iostream>
 #include <map>
 #include <set>
-#include <sstream>
-#include <stdio.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include <osquery/core/tables.h>
+#include <osquery/core/windows/ntapi.h>
 #include <osquery/logger/logger.h>
 #include <osquery/sql/dynamic_table_row.h>
 #include <osquery/sql/sql.h>
 #include <osquery/utils/conversions/windows/strings.h>
 
+// Link against ntdll.lib directly to access NT Native API functions
+// (NtQueryObject, NtQuerySystemInformation, NtDuplicateObject, etc.)
+// that are not exposed through standard Win32 headers
 #pragma comment(lib, "ntdll.lib")
 
 namespace osquery {
+
+HIDDEN_FLAG(bool,
+            allow_handle_threads,
+            false,
+            "Allow handles table to use blockable threads as a fallback"
+            " when the system handle information query fails");
+
 namespace tables {
 
 namespace handles {
 
-#ifndef ULONG
-#define ULONG unsigned long
-#endif
-
-#ifndef STATUS_SUCCESS
-#define STATUS_SUCCESS 0L
-#endif
-
 constexpr size_t INITIAL_ENUMERATION_BUFFER_SIZE = 1024 * 1024 * 4; // 4 MBs
 constexpr size_t MAXIMUM_ENUMERATION_BUFFER_SIZE = 1024 * 1024 * 1024; // 1GB
 
-#ifndef SystemExtendedHandleInformation
-#define SystemExtendedHandleInformation ((SYSTEM_INFORMATION_CLASS)64)
-#endif
-
-#ifndef ObjectNameInformation
-#define ObjectNameInformation ((OBJECT_INFORMATION_CLASS)1)
-#endif
-
-#ifndef ObjectTypeInformation
-#define ObjectTypeInformation ((OBJECT_INFORMATION_CLASS)2)
-#endif
-
-#ifndef ObjectAllTypesInformation
-#define ObjectAllTypesInformation ((OBJECT_INFORMATION_CLASS)3)
-#endif
-
 #ifndef MemoryMappedFilenameInformation
 #define MemoryMappedFilenameInformation 2
-#endif
-
-#ifndef STATUS_UNSUCCESSFUL
-#define STATUS_UNSUCCESSFUL 0xC0000001L
-#endif
-
-#ifndef STATUS_INFO_LENGTH_MISMATCH
-#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004L
-#endif
-
-#ifndef STATUS_ACCESS_DENIED
-#define STATUS_ACCESS_DENIED 0xC0000022L
-#endif
-
-#ifndef STATUS_BUFFER_TOO_SMALL
-#define STATUS_BUFFER_TOO_SMALL 0xC0000023L
-#endif
-
-#ifndef STATUS_NOT_SUPPORTED
-#define STATUS_NOT_SUPPORTED 0xC00000BBL
-#endif
-
-#ifndef STATUS_INVALID_HANDLE
-#define STATUS_INVALID_HANDLE 0xC0000008L
-#endif
-
-#ifndef STATUS_RETRY
-#define STATUS_RETRY 0xC000022DL
 #endif
 
 #ifndef THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH
 #define THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH 0x00000002
 #endif
 
-
+// Alignment helpers for walking the serialized buffer returned by
+// NtQueryObject(ObjectAllTypesInformation).  Each OBJECT_TYPE_INFORMATION
+// entry is followed by its TypeName string data, and the next entry starts
+// at the next pointer-aligned boundary after that string.
 constexpr size_t AlignUp(size_t value, size_t align) {
   return (value + (align - 1)) & ~(align - 1);
 }
@@ -104,6 +62,8 @@ constexpr size_t AlignUpPtr(size_t value) {
   return AlignUp(value, sizeof(void*));
 }
 
+// NT Native API structures for handle enumeration and object type queries.
+// These are not part of the public Windows SDK
 typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
   PVOID Object;
   ULONG_PTR UniqueProcessId;
@@ -186,6 +146,9 @@ typedef struct _QUERY_OBJECT_NAME_PARAMS {
   NTSTATUS ntStatus;
 } QUERY_OBJECT_NAME_PARAMS, *PQUERY_OBJECT_NAME_PARAMS;
 
+// NT Native API function declarations.  These are exported by ntdll.dll but
+// are not declared in standard Windows SDK headers.  We declare them with
+// extern "C" linkage and link against ntdll.lib (see #pragma above).
 extern "C" NTSTATUS NTAPI NtDuplicateObject(HANDLE SourceProcessHandle,
                                             HANDLE SourceHandle,
                                             HANDLE TargetProcessHandle,
@@ -247,7 +210,8 @@ enum class ErrorStage {
   HandleDuplication = 2,
   ObjectBasicInfoQuerying = 3,
   ObjectTypeInfoQuerying = 4,
-  ObjectNameQuerying = 5
+  ObjectNameQuerying = 5,
+  ObjectNameMapping = 6
 };
 
 enum class MappingTechniqueResult {
@@ -270,6 +234,8 @@ std::string_view ErrorStageString(ErrorStage stage) {
     return "ObjectTypeInfoQuerying";
   case ErrorStage::ObjectNameQuerying:
     return "ObjectNameQuerying";
+  case ErrorStage::ObjectNameMapping:
+    return "ObjectNameMapping";
   default:
     return "Unknown";
   }
@@ -336,9 +302,8 @@ struct KeyHash {
 };
 using GrantedAccessCache = std::unordered_map<std::pair<ULONG, std::string>, std::string, KeyHash>;
 using HandleAttributesCache = std::unordered_map<ULONG, std::string>;
-using ObjectTypeNameCache = std::unordered_map<std::wstring, std::string>;
 using ObjectNameCache = std::unordered_map<std::wstring, std::string>;
-using HandleTypeMap = std::unordered_map<ULONG, std::wstring>;
+using HandleTypeMap = std::unordered_map<ULONG, std::string>;
 
 // Cache for handle enumeration that allows us to avoid expensive operations like string
 // conversions and access mask decoding when possible.  During enumeration we could possibly
@@ -347,7 +312,6 @@ using HandleTypeMap = std::unordered_map<ULONG, std::wstring>;
 //
 class HandleRecordCache {
  private:
-  ObjectTypeNameCache m_objectTypeNameCache;
   GrantedAccessCache m_grantedAccessCache;
   HandleAttributesCache m_handleAttributesCache;
   ObjectNameCache m_objectNameCache;
@@ -361,7 +325,7 @@ class HandleRecordCache {
   }
 
  public:
-  HandleRecordCache() {}
+  HandleRecordCache() = default;
 
   // ObjectName comes in as a unicode string, but we will cache
   // it as an std::string for use in our final output.  The function
@@ -370,7 +334,7 @@ class HandleRecordCache {
   // "Unknown" for objects we failed to query the name of.
   //
   const std::string* GetObjectName(PUNICODE_STRING us) {
-    return GetObjectName(this->FromPUnicodeString(us));
+    return GetObjectName(FromPUnicodeString(us));
   }
 
   const std::string* GetObjectName(const std::wstring& lookup) {
@@ -389,39 +353,13 @@ class HandleRecordCache {
     return &(insertIt->second);
   }
 
-  // ObjectTypeName comes in as a unicode string, but we will cache
-  // it as an std::string for use in our final output.  The function
-  // is overloaded to allow callers to pass in either a PUNICODE_STRING (default)
-  // or a std::wstring in cases where we are storing special sentinel values like
-  // "Unknown" for objects we failed to query the name of.
-  //
-  const std::string* GetObjectTypeName(PUNICODE_STRING us) {
-    return GetObjectTypeName(this->FromPUnicodeString(us));
-  }
-
-  const std::string* GetObjectTypeName(const std::wstring& lookup) {
-    if (lookup.empty()) {
-      return nullptr;
-    }
-
-    auto it = m_objectTypeNameCache.find(lookup);
-    if (it != m_objectTypeNameCache.end()) {
-      // Found!
-      return &(it->second);
-    }
-
-    // Not found. Insert the lookup string.
-    std::string converted = wstringToString(lookup.c_str());
-    auto [insertIt, _] = m_objectTypeNameCache.try_emplace(std::move(lookup), std::move(converted));
-    return &(insertIt->second);
-  }
-
   // During Enumeration we collect granted access as a raw mask, but we want to convert it
   // to a string for our final output.  This function is used to cache the results of
   // that conversion.  We are returning the result as an std::string instead of a pointer
   // because this function is only called at row generation time, and will be copied regardless
   //
-  std::string GetGrantedAccessString(ULONG grantedAccess, const std::string& type) {
+  std::string& GetGrantedAccessString(ULONG grantedAccess,
+                                      const std::string& type) {
     auto it = m_grantedAccessCache.find({grantedAccess, type});
     if (it != m_grantedAccessCache.end()) {
       return it->second;
@@ -459,7 +397,8 @@ class HandleRecordCache {
 
       // Combine results
       if (rights.empty()) {
-        return "NO_ACCESS";
+        static std::string noAccess = "NO_ACCESS";
+        return noAccess;
       }
 
       std::string accessRights;
@@ -478,12 +417,13 @@ class HandleRecordCache {
   // Similar to GetGrantedAccessString, we want to cache the results of
   // decoding handle attributes for use in our final output.
   //
-  std::string GetHandleAttributesString(ULONG handleAttributes) {
+  std::string& GetHandleAttributesString(ULONG handleAttributes) {
+    static std::string none = "None";
     if (0 == handleAttributes) {
-      return "None";
+      return none;
     }
 
-    auto it = this->m_handleAttributesCache.find(handleAttributes);
+    auto it = m_handleAttributesCache.find(handleAttributes);
     if (it != m_handleAttributesCache.end()) {
       return it->second;
     } else {
@@ -497,7 +437,7 @@ class HandleRecordCache {
       }
 
       if (attributes.empty()) {
-        return std::to_string(handleAttributes);
+        return none;
       }
 
       std::string attributesStr;
@@ -508,15 +448,34 @@ class HandleRecordCache {
         }
       }
 
-      auto [it, _] = this->m_handleAttributesCache.try_emplace(handleAttributes, std::move(attributesStr));
+      auto [it, _] = m_handleAttributesCache.try_emplace(
+          handleAttributes, std::move(attributesStr));
       return it->second;
     }
   }
 
-  // We cache the mapping of ObjectTypeIndex to ObjectTypeName here as well
-  // since we need to query the type name
-  HandleTypeMap& GetHandleTypeMap() {
-    return this->m_handleTypeMap;
+  void CacheHandleType(ULONG typeIndex, const std::wstring& typeName) {
+    auto it = m_handleTypeMap.find(typeIndex);
+    if (it != m_handleTypeMap.end()) {
+      return;
+    }
+    m_handleTypeMap[typeIndex] = wstringToString(typeName.c_str());
+  }
+
+  void CacheHandleType(ULONG typeIndex, PUNICODE_STRING typeName) {
+    auto it = m_handleTypeMap.find(typeIndex);
+    if (it != m_handleTypeMap.end()) {
+      return;
+    }
+    CacheHandleType(typeIndex, FromPUnicodeString(typeName));
+  }
+
+  std::string* GetCachedHandleType(ULONG typeIndex) {
+    auto it = m_handleTypeMap.find(typeIndex);
+    if (it != m_handleTypeMap.end()) {
+      return &it->second;
+    }
+    return nullptr;
   }
 };
 
@@ -530,8 +489,6 @@ class HandleRecord {
   ErrorStage m_errorStage{ErrorStage::None};
   // the error code resulting from the error, if any
   DWORD m_errorStatus{0};
-  // the name of the object type, if available
-  const std::string* m_ObjectTypeName{nullptr};
   // the granted access mask for the handle
   ULONG m_GrantedAccess = 0;
   // the handle attributes
@@ -543,190 +500,134 @@ class HandleRecord {
   // the name of the object, if available
   const std::string* m_ObjectName{nullptr};
   // the process ID associated with the handle
-  ULONG_PTR ProcessId = 0;
+  DWORD m_ProcessId = 0;
   // reference to the handle record cache
   HandleRecordCache& m_cache;
   // the handle value
-  ULONG_PTR HandleValue = 0;
+  HANDLE m_HandleValue = 0;
   // the object type index
-  USHORT ObjectTypeIndex = 0;
+  USHORT m_ObjectTypeIndex = 0;
 
  public:
   HandleRecord(PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX entry, HandleRecordCache& cache) : m_cache(cache) {
-    this->ProcessId = entry->UniqueProcessId;
-    this->HandleValue = entry->HandleValue;
-    this->m_GrantedAccess = entry->GrantedAccess;
-    this->ObjectTypeIndex = entry->ObjectTypeIndex;
-    this->m_HandleAttributes = entry->HandleAttributes;
+    m_ProcessId = static_cast<DWORD>(entry->UniqueProcessId);
+    m_HandleValue = reinterpret_cast<HANDLE>(entry->HandleValue);
+    m_GrantedAccess = entry->GrantedAccess;
+    m_ObjectTypeIndex = entry->ObjectTypeIndex;
+    m_HandleAttributes = entry->HandleAttributes;
   }
 
   // Setters and Getters optimized to use the cache where possible for
   // string conversions and lookups
 
-  ULONG_PTR Handle() const {
-    return this->HandleValue;
+  HANDLE Handle() const {
+    return m_HandleValue;
   }
 
   USHORT TypeIndex() const {
-    return this->ObjectTypeIndex;
+    return m_ObjectTypeIndex;
   }
 
-  ULONG_PTR Pid() const {
-    return this->ProcessId;
+  DWORD Pid() const {
+    return m_ProcessId;
   }
 
   void SetObjectName(PUNICODE_STRING objectName) {
-    this->m_ObjectName = this->m_cache.GetObjectName(objectName);
+    m_ObjectName = m_cache.GetObjectName(objectName);
   }
   void SetObjectName(const std::wstring& objectName) {
-    this->m_ObjectName = this->m_cache.GetObjectName(objectName);
+    m_ObjectName = m_cache.GetObjectName(objectName);
   }
 
   void SetObjectTypeName(PUNICODE_STRING objectTypeName) {
-    this->m_ObjectTypeName = this->m_cache.GetObjectTypeName(objectTypeName);
+    m_cache.CacheHandleType(m_ObjectTypeIndex, objectTypeName);
   }
 
   void SetGrantedAccess(ULONG grantedAccess) {
-    this->m_GrantedAccess = grantedAccess;
+    m_GrantedAccess = grantedAccess;
   }
 
   void SetHandleAttributes(ULONG handleAttributes) {
-    this->m_HandleAttributes = handleAttributes;
+    m_HandleAttributes = handleAttributes;
   }
 
   void SetRawPointerCount(ULONG rawPointerCount) {
-    this->m_RawPointerCount = rawPointerCount;
+    m_RawPointerCount = rawPointerCount;
   }
 
   void SetHandleCount(ULONG handleCount) {
-    this->m_HandleCount = handleCount;
+    m_HandleCount = handleCount;
   }
 
-  std::string Type() {
-    // If we have a valid type, return it
-    if (this->m_ObjectTypeName) {
-      return *this->m_ObjectTypeName;
-    }
-
+  const std::string& Type() {
     // If we don't have a valid type, attempt to look it up in the cache using the ObjectTypeIndex.
     // If we find a match, cache it and return it
-    auto it = this->m_cache.GetHandleTypeMap().find(this->ObjectTypeIndex);
-    if (it != this->m_cache.GetHandleTypeMap().end()) {
-      const std::string* typeName = this->m_cache.GetObjectTypeName(it->second);
-      if (typeName) {
-        return *typeName;
-      }
+    std::string* typeName = m_cache.GetCachedHandleType(m_ObjectTypeIndex);
+    if (typeName) {
+      return *typeName;
     }
-    return "Unknown";
+    static std::string unknown = "Unknown";
+    return unknown;
   }
 
-  std::string Access() {
-    const std::string type = this->Type();
-    return this->m_cache.GetGrantedAccessString(this->m_GrantedAccess, type);
+  const std::string& Access() {
+    return m_cache.GetGrantedAccessString(m_GrantedAccess, Type());
   }
 
-  std::string Attributes() {
-    return this->m_cache.GetHandleAttributesString(this->m_HandleAttributes);
+  const std::string& Attributes() {
+    return m_cache.GetHandleAttributesString(m_HandleAttributes);
   }
 
-  std::string Name() const {
-    return this->m_ObjectName ? *this->m_ObjectName : "Unknown";
+  const std::string& Name() {
+    static std::string unknown = "Unknown";
+    return m_ObjectName ? *m_ObjectName : unknown;
   }
 
   ULONG RawPointerCount() const {
-    return this->m_RawPointerCount;
+    return m_RawPointerCount;
   }
 
   ULONG HandleCount() const {
-    return this->m_HandleCount;
+    return m_HandleCount;
   }
 
   void SetError(ErrorStage errorStage, DWORD errorStatus, bool logError = false) {
-    this->m_errorStage = errorStage;
-    this->m_errorStatus = errorStatus;
+    m_errorStage = errorStage;
+    m_errorStatus = errorStatus;
 
     if (!logError) {
       return;
     }
-
-    std::stringstream errorStatusStream;
-    switch (errorStage) {
-    case ErrorStage::ProcessOpening:
-      errorStatusStream << "Error opening process";
-      break;
-    case ErrorStage::HandleDuplication:
-      errorStatusStream << "Error duplicating handle";
-      break;
-    case ErrorStage::ObjectBasicInfoQuerying:
-      errorStatusStream << "Error querying object basic info";
-      break;
-    case ErrorStage::ObjectTypeInfoQuerying:
-      errorStatusStream << "Error querying object type info";
-      break;
-    case ErrorStage::ObjectNameQuerying:
-      errorStatusStream << "Error querying object name";
-      break;
-    default:
-      errorStatusStream << "Unknown error";
-      break;
-    }
-    errorStatusStream << " Pid: " << this->ProcessId << " Error Code: " << this->m_errorStatus << " Handle 0x"
-                      << std::hex << this->HandleValue << std::dec;
-    LOG(ERROR) << errorStatusStream.str();
+    VLOG(1) << "Error during handle enumeration. "
+            << ErrorStageString(errorStage) << " Pid: " << m_ProcessId
+            << " Error Code: " << m_errorStatus << " Handle 0x" << std::hex
+            << m_HandleValue << std::dec;
   }
 
   ErrorStage GetErrorStage() const {
-    return this->m_errorStage;
+    return m_errorStage;
   }
 
   DWORD GetErrorCode() const {
-    return this->m_errorStatus;
+    return m_errorStatus;
   }
 
   Row ToRow() {
     Row row;
-    row["pid"] = INTEGER(this->Pid());
-    row["handle_value"] = INTEGER(this->HandleValue);
-    row["type"] = this->Type();
-    row["access"] = this->Access();
-    row["name"] = this->Name();
-    row["attributes"] = this->Attributes();
-    row["handle_count"] = INTEGER(this->HandleCount());
-    row["raw_pointer_count"] = INTEGER(this->RawPointerCount());
-    row["error_stage"] = ErrorStageString(this->GetErrorStage());
-    row["error_code"] = INTEGER(this->GetErrorCode());
+    row["pid"] = INTEGER(Pid());
+    row["handle_value"] = INTEGER(reinterpret_cast<uintptr_t>(Handle()));
+    row["type"] = Type();
+    row["access"] = Access();
+    row["name"] = Name();
+    row["attributes"] = Attributes();
+    row["handle_count"] = INTEGER(HandleCount());
+    row["raw_pointer_count"] = INTEGER(RawPointerCount());
+    row["error_stage"] = ErrorStageString(GetErrorStage());
+    row["error_code"] = INTEGER(GetErrorCode());
     return row;
   }
 };
 using HandleRecordPtr = std::unique_ptr<HandleRecord>;
-
-// Parent class that holds the state of handle enumeration,
-// including the cache, the list of PIDs to filter on, and the resulting handle
-// records that will be converted to rows for output.
-class HandleEnumeration {
- public:
-  HandleRecordCache m_cache;
-  std::set<int> m_pidlist;
-  std::vector<HandleRecordPtr> handleRecords;
-
-  HandleEnumeration(const std::set<int>& pidlist) : m_pidlist(pidlist) {}
-
-  bool IsPidFiltered(DWORD pid) const {
-    return !m_pidlist.empty() && m_pidlist.find(pid) == m_pidlist.end();
-  }
-
-  HandleRecordCache& Cache() {
-    return m_cache;
-  }
-
-  QueryData ToRows() {
-    QueryData rows;
-    for (const auto& handle : this->handleRecords) {
-      rows.push_back(handle->ToRow());
-    }
-    return rows;
-  }
-};
 
 // Helper struct to query the os version, as certain operations we
 // perform during handle enumeration are only supported on certain
@@ -751,6 +652,14 @@ struct OSVersionInfo {
 };
 static const OSVersionInfo gOSVersionInfo;
 
+struct HandleCloser {
+  void operator()(void* h) const {
+    if (h && h != INVALID_HANDLE_VALUE)
+      CloseHandle(h);
+  }
+};
+using ScopedHandle = std::unique_ptr<void, HandleCloser>;
+
 // Helper function to set the SeDebugPrivilege for the current process,
 // which allows us to query handles from processes we don't own.
 // We attempt to set this privilege at the start of enumeration,
@@ -759,25 +668,17 @@ static const OSVersionInfo gOSVersionInfo;
 //
 DWORD
 SetDebugTokenPrivilege() {
-  DWORD dwStatus = ERROR_SUCCESS;
   HANDLE hToken = NULL;
   TOKEN_PRIVILEGES tp = {0};
   LUID val = {0};
 
-  // This ensures the token handle is always closed when we exit this function, even in error cases
-  struct HandleTokenCloser {
-    HANDLE& handle;
-    HandleTokenCloser(HANDLE& handle) : handle(handle) {}
-    ~HandleTokenCloser() {
-      if (handle != NULL && handle != INVALID_HANDLE_VALUE) {
-        CloseHandle(handle);
-      }
-    };
-  } handleTokenCloser{hToken};
-
-  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+  if (!OpenProcessToken(GetCurrentProcess(),
+                        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                        &hToken)) {
     return GetLastError();
   }
+
+  auto scopedToken = ScopedHandle(hToken);
 
   if (!LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &val)) {
     return GetLastError();
@@ -787,7 +688,7 @@ SetDebugTokenPrivilege() {
   tp.Privileges[0].Luid = val;
   tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-  if (!AdjustTokenPrivileges(hToken, FALSE, &tp, NULL, NULL, NULL)) {
+  if (!AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, NULL)) {
     return GetLastError();
   }
 
@@ -797,29 +698,33 @@ SetDebugTokenPrivilege() {
     return ERROR_NOT_ALL_ASSIGNED;
   }
 
-  return dwStatus;
+  return ERROR_SUCCESS;
 }
 
-// The thread executing this function may be terminated (likely) while hung in
+// Thread function for querying an object's name via NtQueryObject.
+// This thread may be terminated via TerminateThread if NtQueryObject blocks
+// on a synchronous file handle (named pipe, console, etc.).  Because
+// TerminateThread does not run destructors or release synchronization
+// objects, this function must not allocate heap memory, hold locks, or
+// use any RAII constructs.
 DWORD
 WINAPI
 QueryObjectNameThreadFunc(LPVOID lpParam) {
-  DWORD ntStatus = ERROR_SUCCESS;
-  ULONG retLen = 0;
-  PQUERY_OBJECT_NAME_PARAMS params = (PQUERY_OBJECT_NAME_PARAMS)lpParam;
+  auto params = static_cast<PQUERY_OBJECT_NAME_PARAMS>(lpParam);
 
-  if (nullptr == params) {
-    ntStatus = ERROR_INVALID_PARAMETER;
-    goto Cleanup;
+  if (!params) {
+    return ERROR_INVALID_PARAMETER;
   }
-
+  ULONG retLen = 0;
   params->ntStatus =
       NtQueryObject(params->hObject, ObjectNameInformation, &params->nameBuffer, sizeof(params->nameBuffer), &retLen);
 
-Cleanup:
-  return ntStatus;
+  // the real result of the query is in params->ntStatus
+  return ERROR_SUCCESS;
 }
 
+// Construct and cache a list of all known types by calling
+// ObjectAllTypesInformation
 NTSTATUS
 GetObjectTypeEnumeration(HandleRecordCache& cache) {
   NTSTATUS ntStatus = STATUS_SUCCESS;
@@ -828,7 +733,7 @@ GetObjectTypeEnumeration(HandleRecordCache& cache) {
   std::vector<uint8_t> localBuffer(INITIAL_ENUMERATION_BUFFER_SIZE);
 
   if (!gOSVersionInfo.isWin80OrGreater) {
-    LOG(ERROR) << "Object type enumeration is only supported on Windows 8.0+";
+    VLOG(1) << "Object type enumeration is only supported on Windows 8.0+";
     return STATUS_NOT_SUPPORTED;
   }
 
@@ -840,7 +745,7 @@ GetObjectTypeEnumeration(HandleRecordCache& cache) {
     // types, it will not change so fast that the required buffer size doubles
     // between our calls. It's atypical for it to dynamically change at all
     // on most systems.
-    size_t newSize = retLen * 2;
+    size_t newSize = static_cast<size_t>(retLen) * 2;
     if ((newSize > MAXIMUM_ENUMERATION_BUFFER_SIZE) || (newSize > ULONG_MAX)) {
       return STATUS_BUFFER_TOO_SMALL;
     }
@@ -850,93 +755,40 @@ GetObjectTypeEnumeration(HandleRecordCache& cache) {
   }
 
   if (!NT_SUCCESS(ntStatus)) {
-    LOG(ERROR) << "Failed to query object all types information: 0x" << std::hex << ntStatus << std::dec;
+    VLOG(1) << "Failed to query object all types information: 0x" << std::hex
+            << ntStatus << std::dec;
     return ntStatus;
   }
 
   pTypes = reinterpret_cast<POBJECT_ALL_TYPES_INFORMATION>(localBuffer.data());
   if (pTypes->NumberOfTypes > USHRT_MAX) {
-    LOG(ERROR) << "Too many object types (" << pTypes->NumberOfTypes
-               << ") exceeds a uint16_t which is used for handle type indices";
+    VLOG(1) << "Too many object types (" << pTypes->NumberOfTypes
+            << ") exceeds a uint16_t which is used for handle type indices";
     return STATUS_INTEGER_OVERFLOW;
   }
 
-  // Initialize the iter
+  // Walk the serialized array of OBJECT_TYPE_INFORMATION entries.  Entries are
+  // variable-length: each struct is followed by its TypeName string data, and
+  // the next entry starts at the next pointer-aligned address.
   POBJECT_TYPE_INFORMATION typeIter = &pTypes->Types[0];
   for (ULONG i = 0; i < pTypes->NumberOfTypes; i++) {
-    cache.GetHandleTypeMap()[typeIter->TypeIndex] =
-        std::wstring(typeIter->TypeName.Buffer, typeIter->TypeName.Length / sizeof(WCHAR));
+    cache.CacheHandleType(
+        typeIter->TypeIndex,
+        std::wstring(typeIter->TypeName.Buffer,
+                     typeIter->TypeName.Length / sizeof(WCHAR)));
 
     // advance our iterator, accounting for the trailing serialized string
     // buffer and alignment
-    typeIter = (POBJECT_TYPE_INFORMATION)((PBYTE)typeIter + AlignUpPtr(sizeof(OBJECT_TYPE_INFORMATION) +
-                                                                       typeIter->TypeName.MaximumLength));
+    typeIter = reinterpret_cast<POBJECT_TYPE_INFORMATION>(
+        reinterpret_cast<PBYTE>(typeIter) +
+        AlignUpPtr(sizeof(OBJECT_TYPE_INFORMATION) +
+                   typeIter->TypeName.MaximumLength));
   }
 
   return STATUS_SUCCESS;
 }
 
-// Get handle enumeration and a minimal type mapping. The mapping is constructed
-// by calling ObjectAllTypesInformation before and after the handle enumeration
-// and verifying the two snapshots match (number and names). If they match we
-// construct a minimal map (index -> name) and return it in ppTypeMap.
-// Caller must free both *ppHandleInfo and the type map and its internal name
-// buffers.
-DWORD
-GetHandleAndTypeEnumeration(HandleEnumeration& handleEnum) {
-  NTSTATUS ntStatus = STATUS_SUCCESS;
-  PSYSTEM_HANDLE_INFORMATION_EX pHandleInfo = nullptr;
-  ULONG retLen = 0;
 
-  std::vector<uint8_t> localBuffer(INITIAL_ENUMERATION_BUFFER_SIZE);
-
-  // 1. Acquire the type enumeration if supported.
-  ntStatus = GetObjectTypeEnumeration(handleEnum.Cache());
-  if (STATUS_SUCCESS != ntStatus && STATUS_NOT_SUPPORTED != ntStatus) {
-    LOG(ERROR) << "Failed to query object type enumeration: 0x" << std::hex << ntStatus << std::dec;
-    return ntStatus;
-  }
-
-  // 2. Query handles
-  ntStatus =
-      NtQuerySystemInformation(SystemExtendedHandleInformation, localBuffer.data(), (ULONG)localBuffer.size(), &retLen);
-
-  if (STATUS_INFO_LENGTH_MISMATCH == ntStatus) {
-    // We assume that the quantity of handles won't more than double between our
-    // calls, on typical system we'll be expecting on the order of 10s of thousands
-    // of handles
-    size_t newSize = retLen * 2;
-    if ((newSize > MAXIMUM_ENUMERATION_BUFFER_SIZE) || (newSize > ULONG_MAX)) {
-      return STATUS_BUFFER_TOO_SMALL;
-    }
-    localBuffer.resize(newSize);
-    ntStatus = NtQuerySystemInformation(SystemExtendedHandleInformation, localBuffer.data(), (ULONG)newSize, &retLen);
-  }
-
-  if (STATUS_SUCCESS != ntStatus) {
-    LOG(ERROR) << "Failed to query system handle information: 0x" << std::hex << ntStatus << std::dec;
-    return ntStatus;
-  }
-
-  // 3. Filter and process the basic enumeration into our record structure
-  pHandleInfo = reinterpret_cast<PSYSTEM_HANDLE_INFORMATION_EX>(localBuffer.data());
-  for (ULONG i = 0; i < pHandleInfo->NumberOfHandles; i++) {
-    PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX entry = &pHandleInfo->Handles[i];
-
-    if (!entry) {
-      LOG(ERROR) << "Null entry found in handle enumeration at index " << i;
-      continue;
-    }
-
-    if (handleEnum.IsPidFiltered((int)entry->UniqueProcessId)) {
-      continue;
-    }
-    auto handleRecord = std::make_unique<HandleRecord>(entry, handleEnum.Cache());
-    handleEnum.handleRecords.emplace_back(std::move(handleRecord));
-  }
-
-  return STATUS_SUCCESS;
-}
 
 // Attempt to resolve a File object's name by creating a section, mapping a
 // view, and querying the mapped filename.  On success the result is written
@@ -980,229 +832,451 @@ GetFileObjectNameViaMappingTechnique(HANDLE hFile, QUERY_OBJECT_NAME_PARAMS& par
   return MappingTechniqueResult::Success;
 }
 
-DWORD
-EnumerateAllHandles(const std::set<int>& pidlist, HandleEnumeration& handleEnumeration, bool bUseBlockableThreads) {
-  NTSTATUS ntStatus = STATUS_SUCCESS;
-  UNICODE_STRING fileTypeName = {0};
-  std::set<ULONG_PTR> accessDeniedPIDs;
+/// Retrieves a process handle for duplication, using caches to avoid
+/// redundant OpenProcess calls.  Returns the process HANDLE on success.
+/// On failure, sets the error on the HandleRecord and returns
+/// INVALID_HANDLE_VALUE.
+HANDLE AcquireProcessHandle(
+    HandleRecord& record,
+    std::unordered_map<ULONG_PTR, DWORD>& failedPIDErrors,
+    std::unordered_map<ULONG_PTR, ScopedHandle>& processHandleCache) {
+  HANDLE processHandle = INVALID_HANDLE_VALUE;
 
-  // cache process handles, so we don't call openprocess for every handle
-  struct HandleCloser {
-    using pointer = HANDLE;
-    void operator()(HANDLE h) const {
-      if (h != NULL && h != INVALID_HANDLE_VALUE) {
-        CloseHandle(h);
+  // 2a. Open the source process
+  auto failedPidIt = failedPIDErrors.find(record.Pid());
+  if (failedPidIt != failedPIDErrors.end()) {
+    record.SetError(ErrorStage::ProcessOpening, failedPidIt->second);
+    return INVALID_HANDLE_VALUE;
+  }
+
+  DWORD openProcessError = ERROR_SUCCESS;
+  auto cachedHandleIt = processHandleCache.find(record.Pid());
+  if (cachedHandleIt != processHandleCache.end()) {
+    processHandle = cachedHandleIt->second.get();
+  } else {
+    processHandle = OpenProcess(PROCESS_DUP_HANDLE, FALSE, record.Pid());
+    openProcessError = GetLastError();
+    // cache the handle (including failures) to avoid repeated attempts on the
+    // same PID which can happen with many handles from the same process
+    processHandleCache.try_emplace(record.Pid(), processHandle);
+  }
+
+  if (NULL == processHandle || INVALID_HANDLE_VALUE == processHandle) {
+    record.SetError(ErrorStage::ProcessOpening, openProcessError);
+    failedPIDErrors.insert({record.Pid(), openProcessError});
+    return INVALID_HANDLE_VALUE;
+  }
+
+  return processHandle;
+}
+
+/// Resolve the name of the object referenced by duplicatedObjectHandle.
+/// For File objects, uses the mapping technique first, then optionally
+/// falls back to a thread with a timeout.  For non-File objects, queries
+/// NtQueryObject directly (which is safe — only File objects can block).
+void ResolveObjectName(HandleRecord& record,
+                       HANDLE duplicatedObjectHandle,
+                       const UNICODE_STRING& objectTypeName,
+                       const UNICODE_STRING& fileTypeName,
+                       QUERY_OBJECT_NAME_PARAMS& params) {
+  ULONG retLen = 0;
+  bool bThreadWaitSatisfied = false;
+
+  // Prepare params for querying the name
+  // STATUS_UNSUCCESSFUL allows us to detect failure in the thread if it
+  // doesn't get to the point of setting it.
+  params = {0};
+  params.hObject = duplicatedObjectHandle;
+  params.ntStatus = STATUS_UNSUCCESSFUL;
+
+  // Consolidates the name-result recording logic used by all exit paths below.
+  auto updateRecordWithNameResult = [&record, &params]() -> void {
+    switch (params.ntStatus) {
+    case STATUS_SUCCESS:
+      if (params.nameBuffer.usName.Length > 0) {
+        record.SetObjectName(&params.nameBuffer.usName);
+      } else {
+        record.SetObjectName(L"None");
       }
+      break;
+    case STATUS_UNSUCCESSFUL:
+      record.SetObjectName(L"<query would block, synch file handle>");
+      break;
+    default:
+      record.SetObjectName(L"<failed resolving>");
+      break;
+    }
+
+    if (!NT_SUCCESS(params.ntStatus)) {
+      record.SetError(ErrorStage::ObjectNameQuerying,
+                      RtlNtStatusToDosError(params.ntStatus),
+                      true);
     }
   };
-  using SmartHandle = std::unique_ptr<HANDLE, HandleCloser>;
-  std::unordered_map<ULONG_PTR, SmartHandle> processHandleCache;
 
-  // 1.  Acquire the enumerations.
-  ntStatus = GetHandleAndTypeEnumeration(handleEnumeration);
-
-  if (STATUS_SUCCESS != ntStatus) {
-    DWORD dwStatus = RtlNtStatusToDosError(ntStatus);
-    LOG(ERROR) << "Failed to query system handle information / type mapping: 0x" << std::hex << dwStatus << std::dec;
-    return dwStatus;
+  // For File object types the NtQueryObject call could block
+  // indefinitely (sync consoles, pipes, etc.)  We first attempt the
+  // non-blocking mapping technique (section + mapped filename query).
+  // If the mapping technique fails and the caller opted in via
+  // FLAGS_allow_handle_threads, we fall back to a thread with a timeout.
+  if (0 != RtlCompareUnicodeString(&objectTypeName, &fileTypeName, FALSE)) {
+    params.ntStatus = NtQueryObject(params.hObject,
+                                    ObjectNameInformation,
+                                    &params.nameBuffer,
+                                    sizeof(params.nameBuffer),
+                                    &retLen);
+    updateRecordWithNameResult();
+    return;
   }
 
-  RtlInitUnicodeString(&fileTypeName, L"File");
+  MappingTechniqueResult mappingResult =
+      GetFileObjectNameViaMappingTechnique(duplicatedObjectHandle, params);
 
-  // Allocate these outside of the loop to avoid unnecessary stack allocation on each iteration
-  OBJECT_TYPE_INFORMATION_WITH_STORAGE objTypeInfo = {0};
-  QUERY_OBJECT_NAME_PARAMS params = {0};
-  OBJECT_BASIC_INFORMATION objBasicInfo = {0};
-
-  // 2. Enrich Handle records
-  for (auto& handleIter : handleEnumeration.handleRecords) {
-    HANDLE duplicatedObjectHandle = INVALID_HANDLE_VALUE;
-    HANDLE processHandle = INVALID_HANDLE_VALUE;
-
-    // 2a. Open the source process
-    auto accessDeniedIt = accessDeniedPIDs.find(handleIter->Pid());
-    if (accessDeniedIt != accessDeniedPIDs.end()) {
-      handleIter->SetError(ErrorStage::ProcessOpening, ERROR_ACCESS_DENIED);
-      continue;
-    }
-
-    auto cachedHandleIt = processHandleCache.find(handleIter->Pid());
-    if (cachedHandleIt != processHandleCache.end()) {
-      processHandle = cachedHandleIt->second.get();
-    } else {
-      processHandle = OpenProcess(PROCESS_DUP_HANDLE, FALSE, (DWORD)handleIter->Pid());
-      // cache the handle (including failures) to avoid repeated attempts on the same PID which can happen with many
-      // handles from the same process
-      processHandleCache.try_emplace(handleIter->Pid(), processHandle);
-    }
-
-    if (NULL == processHandle || INVALID_HANDLE_VALUE == processHandle) {
-      DWORD lastError = GetLastError();
-      handleIter->SetError(ErrorStage::ProcessOpening, lastError);
-      if (lastError == ERROR_ACCESS_DENIED) {
-        accessDeniedPIDs.insert(handleIter->Pid());
-      }
-      continue;
-    }
-
-    // 2b. Duplicate the handle into our process to query it
-    ntStatus = NtDuplicateObject(
-        processHandle, (HANDLE)handleIter->Handle(), GetCurrentProcess(), &duplicatedObjectHandle, GENERIC_READ, 0, 0);
-
-    // 2c. if the request for GENERIC_READ failed, try again with no access
-    // requested
-    if (STATUS_ACCESS_DENIED == ntStatus) {
-      ntStatus = NtDuplicateObject(
-          processHandle, (HANDLE)handleIter->Handle(), GetCurrentProcess(), &duplicatedObjectHandle, 0, 0, 0);
-    }
-
-    // 2d. Query ObjectBasicInformation to get the raw PointerCount and handle
-    // potential handle reuse between our enumeration and duplication.
-    if (STATUS_SUCCESS == ntStatus) {
-      ULONG retLen = 0;
-      ZeroMemory(&objBasicInfo, sizeof(objBasicInfo));
-      ntStatus =
-          NtQueryObject(duplicatedObjectHandle, ObjectBasicInformation, &objBasicInfo, sizeof(objBasicInfo), &retLen);
-      if (STATUS_SUCCESS != ntStatus) {
-        handleIter->SetError(ErrorStage::ObjectBasicInfoQuerying, RtlNtStatusToDosError(ntStatus));
-      } else {
-        // The pointer count is new information we wanted.
-        handleIter->SetRawPointerCount(objBasicInfo.PointerCount);
-
-        // Other information came in the initial enumeration, but we have to
-        // allow for the possibility that the handle value got reused between
-        // that enumeration and now, so if we're able to get to the
-        // ObjectBasicInformation query on the duplicated handle, we should
-        // replace it.
-        handleIter->SetGrantedAccess(objBasicInfo.GrantedAccess);
-        handleIter->SetHandleAttributes(objBasicInfo.Attributes);
-        handleIter->SetHandleCount(objBasicInfo.HandleCount);
-
-        // We query the ObjectTypeInformation to accommodate the potential
-        // handle reuse case, but also on pre-Win8 systems we would not have had
-        // access to type information in the initial enumeration.
-        ZeroMemory(&objTypeInfo, sizeof(objTypeInfo));
-        ntStatus =
-            NtQueryObject(duplicatedObjectHandle, ObjectTypeInformation, &objTypeInfo, sizeof(objTypeInfo), &retLen);
-
-        if (!NT_SUCCESS(ntStatus)) {
-          // If unsuccessful, log the error and move on, we will
-          // have a chance to recover at row generation by checking the type index mapping
-          // against the cache
-          handleIter->SetError(ErrorStage::ObjectTypeInfoQuerying, RtlNtStatusToDosError(ntStatus));
-        } else {
-          bool bThreadWaitSatisfied = false;
-          handleIter->SetObjectTypeName(&objTypeInfo.TypeInfo.TypeName);
-
-          // Prepare params for querying the name
-          // STATUS_UNSUCCESSFUL allows us to detect failure in the thread if it
-          // doesn't get to the point of setting it.
-          ZeroMemory(&params, sizeof(params));
-          params.hObject = duplicatedObjectHandle;
-          params.ntStatus = STATUS_UNSUCCESSFUL;
-
-          // For File object types the NtQueryObject call could block
-          // indefinitely (sync consoles, pipes, etc.)  We first attempt the
-          // non-blocking mapping technique (section + mapped filename query).
-          // If the mapping technique fails and the caller opted in via
-          // bUseBlockableThreads, we fall back to a thread with a timeout.
-          if (0 == RtlCompareUnicodeString(&objTypeInfo.TypeInfo.TypeName, &fileTypeName, FALSE)) {
-            MappingTechniqueResult mappingResult =
-                GetFileObjectNameViaMappingTechnique(duplicatedObjectHandle, params);
-
-            if (MappingTechniqueResult::Success != mappingResult) {
-              if (MappingTechniqueResult::FailedInvalidHandle == mappingResult) {
-                params.ntStatus = STATUS_INVALID_HANDLE;
-              } else if (bUseBlockableThreads) {
-                HANDLE hThread = NULL;
-
-                NTSTATUS ntThreadStatus = NtCreateThreadEx(
-                    &hThread, THREAD_ALL_ACCESS, NULL, GetCurrentProcess(), (PVOID)QueryObjectNameThreadFunc, &params,
-                    THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH, 0, 0, 0, NULL);
-                if (!NT_SUCCESS(ntThreadStatus) || NULL == hThread) {
-                  handleIter->SetError(ErrorStage::ObjectNameQuerying,
-                                       NT_SUCCESS(ntThreadStatus) ? GetLastError()
-                                                                  : RtlNtStatusToDosError(ntThreadStatus));
-                } else {
-                  switch (WaitForSingleObject(hThread, 500)) {
-                  case WAIT_OBJECT_0:
-                    bThreadWaitSatisfied = true;
-                    break;
-                  case WAIT_TIMEOUT:
-                    handleIter->SetError(ErrorStage::ObjectNameQuerying, ERROR_TIMEOUT, true);
-                    LOG(ERROR) << "Querying object timed out for PID: " << handleIter->Pid()
-                               << " | Handle : 0x" << std::hex << handleIter->Handle() << std::dec;
-                    break;
-                  default:
-                    DWORD lastError = GetLastError();
-                    handleIter->SetError(ErrorStage::ObjectNameQuerying, lastError, true);
-                    LOG(ERROR) << "Error waiting for thread for PID: " << handleIter->Pid()
-                               << " | Handle : 0x" << std::hex << handleIter->Handle() << std::dec
-                               << " | Error: " << lastError;
-                    break;
-                  }
-
-                  if (!bThreadWaitSatisfied) {
-                    // Cancel the thread and guarantee it's terminated
-                    TerminateThread(hThread, ERROR_CANCELLED);
-                    WaitForSingleObject(hThread, INFINITE);
-                  }
-
-                  CloseHandle(hThread);
-                }
-              }
-            }
-          }
-          // Not a File object, this query can't block and we don't need a
-          // thread
-          else {
-            params.ntStatus = NtQueryObject(
-                params.hObject, ObjectNameInformation, &params.nameBuffer, sizeof(params.nameBuffer), &retLen);
-          }
-
-          // Whether we called in the thread or called directly, store the error
-          // if necessary
-          if (STATUS_SUCCESS != params.ntStatus) {
-            handleIter->SetError(ErrorStage::ObjectNameQuerying, RtlNtStatusToDosError(params.ntStatus));
-          }
-
-          // Store the name as appropriate
-          switch (params.ntStatus) {
-          case STATUS_SUCCESS:
-            if (params.nameBuffer.usName.Length > 0) {
-              handleIter->SetObjectName(&params.nameBuffer.usName);
-            } else {
-              handleIter->SetObjectName(L"None");
-            }
-            break;
-          case STATUS_UNSUCCESSFUL:
-            handleIter->SetObjectName(L"<query would block, synch file handle>");
-            break;
-          default:
-            handleIter->SetObjectName(L"<failed resolving>");
-            break;
-          }
-        }
-      }
-      if (INVALID_HANDLE_VALUE != duplicatedObjectHandle && NULL != duplicatedObjectHandle) {
-        CloseHandle(duplicatedObjectHandle);
-      }
-    } else {
-      handleIter->SetError(ErrorStage::HandleDuplication, RtlNtStatusToDosError(ntStatus));
-      // STATUS_NOT_SUPPORTED is too common, it slows down execution to print it
-      if (STATUS_NOT_SUPPORTED != ntStatus) {
-        LOG(ERROR) << "Error (0x" << std::hex << ntStatus << std::dec
-                   << ") duplicating handle for PID: " << handleIter->Pid() << " | Handle: 0x" << std::hex
-                   << handleIter->Handle() << std::dec;
-      }
-    }
+  if (MappingTechniqueResult::Success == mappingResult) {
+    updateRecordWithNameResult();
+    return;
   }
 
-  return ERROR_SUCCESS;
+  if (MappingTechniqueResult::FailedInvalidHandle == mappingResult) {
+    params.ntStatus = STATUS_INVALID_HANDLE;
+    updateRecordWithNameResult();
+    return;
+  }
+
+  VLOG(1) << "Mapping technique failed with error 0x" << std::hex
+          << params.ntStatus << std::dec << " for PID: " << record.Pid()
+          << " | Handle : 0x" << std::hex << record.Handle() << std::dec;
+
+  if (!FLAGS_allow_handle_threads) {
+    // Mapping technique failed and thread fallback is disabled (the default).
+    // We cannot safely resolve this name — NtQueryObject could block
+    // indefinitely.  Record the mapping error and leave the name unresolved.
+    record.SetError(ErrorStage::ObjectNameMapping,
+                    RtlNtStatusToDosError(params.ntStatus),
+                    true);
+    return;
+  }
+
+  HANDLE hThread = NULL;
+  NTSTATUS ntThreadStatus =
+      NtCreateThreadEx(&hThread,
+                       THREAD_ALL_ACCESS,
+                       NULL,
+                       GetCurrentProcess(),
+                       static_cast<PVOID>(QueryObjectNameThreadFunc),
+                       &params,
+                       THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH,
+                       0,
+                       0,
+                       0,
+                       NULL);
+
+  if (!NT_SUCCESS(ntThreadStatus) || NULL == hThread) {
+    record.SetError(ErrorStage::ObjectNameQuerying,
+                    NT_SUCCESS(ntThreadStatus)
+                        ? GetLastError()
+                        : RtlNtStatusToDosError(ntThreadStatus));
+    record.SetObjectName(L"<failed resolving>");
+    return;
+  }
+
+  ScopedHandle threadHandle(hThread);
+  switch (WaitForSingleObject(hThread, 500)) {
+  case WAIT_OBJECT_0:
+    bThreadWaitSatisfied = true;
+    break;
+  case WAIT_TIMEOUT:
+    record.SetError(ErrorStage::ObjectNameQuerying, ERROR_TIMEOUT, true);
+    VLOG(1) << "Querying object timed out for PID: " << record.Pid()
+            << " | Handle : 0x" << std::hex << record.Handle() << std::dec;
+    break;
+  default:
+    DWORD lastError = GetLastError();
+    record.SetError(ErrorStage::ObjectNameQuerying, lastError, true);
+    VLOG(1) << "Error waiting for thread for PID: " << record.Pid()
+            << " | Handle : 0x" << std::hex << record.Handle() << std::dec
+            << " | Error: " << lastError;
+    break;
+  }
+
+  if (!bThreadWaitSatisfied) {
+    // Hard-terminate the thread.  TerminateThread is dangerous — it does not
+    // run destructors, release locks, or notify DLLs.  We accept this risk
+    // because the alternative (NtQueryObject blocking forever) is worse.
+    // WaitForSingleObject ensures the thread has fully exited before we
+    // return (and the params struct on our stack goes out of scope).
+    // The user is aware of this risk when they enable the handle threads
+    // fallback via FLAGS_allow_handle_threads.
+    TerminateThread(hThread, ERROR_CANCELLED);
+    WaitForSingleObject(hThread, INFINITE);
+  }
+
+  updateRecordWithNameResult();
 }
+
+/// Duplicate a handle from the target process and query its basic info,
+/// type, and name.  Results are written into the HandleRecord.
+///
+/// objBasicInfo, objTypeInfo, and params are caller-owned reusable buffers
+/// passed in to avoid per-handle stack allocation.  They are zeroed and
+/// repopulated on each call.
+void EnrichHandleRecord(
+    HandleRecord& record,
+    HANDLE processHandle,
+    const UNICODE_STRING& fileTypeName,
+    OBJECT_BASIC_INFORMATION& objBasicInfo, // reusable buffer
+    OBJECT_TYPE_INFORMATION_WITH_STORAGE& objTypeInfo, // reusable buffer
+    QUERY_OBJECT_NAME_PARAMS& params) {
+  NTSTATUS ntStatus = STATUS_SUCCESS;
+  HANDLE duplicatedObjectHandle = INVALID_HANDLE_VALUE;
+
+  // Try duplicating with GENERIC_READ first because the mapping technique
+  // (NtCreateSection) requires read access to the file handle.  If the
+  // source process's handle doesn't grant read, we fall back to a
+  // zero-access duplicate which is sufficient for NtQueryObject but cannot
+  // use the mapping technique.
+  ntStatus = NtDuplicateObject(processHandle,
+                               record.Handle(),
+                               GetCurrentProcess(),
+                               &duplicatedObjectHandle,
+                               GENERIC_READ,
+                               0,
+                               0);
+
+  if (STATUS_ACCESS_DENIED == ntStatus) {
+    ntStatus = NtDuplicateObject(processHandle,
+                                 record.Handle(),
+                                 GetCurrentProcess(),
+                                 &duplicatedObjectHandle,
+                                 0,
+                                 0,
+                                 0);
+  }
+
+  // If duplication still fails, we won't be able to query anything about this
+  // handle, so log the error and return
+  if (!NT_SUCCESS(ntStatus)) {
+    record.SetError(
+        ErrorStage::HandleDuplication, RtlNtStatusToDosError(ntStatus), true);
+    VLOG(1) << "Error (0x" << std::hex << ntStatus << std::dec
+            << ") duplicating handle for PID: " << record.Pid()
+            << " | Handle: 0x" << std::hex << record.Handle() << std::dec;
+    return;
+  }
+
+  // query ObjectBasicInformation to get the raw PointerCount and handle
+  // potential handle reuse between our enumeration and duplication.
+  ULONG retLen = 0;
+  auto scopedDupHandle = ScopedHandle(duplicatedObjectHandle);
+  objBasicInfo = {0};
+  ntStatus = NtQueryObject(duplicatedObjectHandle,
+                           ObjectBasicInformation,
+                           &objBasicInfo,
+                           sizeof(objBasicInfo),
+                           &retLen);
+
+  // If basic info querying fails, there is no new information we can get about
+  // this handle, so log the error and return.
+  if (!NT_SUCCESS(ntStatus)) {
+    record.SetError(ErrorStage::ObjectBasicInfoQuerying,
+                    RtlNtStatusToDosError(ntStatus),
+                    true);
+    VLOG(1) << "Error (0x" << std::hex << ntStatus << std::dec
+            << ") querying basic info for PID: " << record.Pid()
+            << " | Handle: 0x" << std::hex << record.Handle() << std::dec;
+    return;
+  }
+
+  // The pointer count is new information we wanted.
+  record.SetRawPointerCount(objBasicInfo.PointerCount);
+
+  // Other information came in the initial enumeration, but we have to
+  // allow for the possibility that the handle value got reused between
+  // that enumeration and now, so if we're able to get to the
+  // ObjectBasicInformation query on the duplicated handle, we should
+  // replace it.
+  record.SetGrantedAccess(objBasicInfo.GrantedAccess);
+  record.SetHandleAttributes(objBasicInfo.Attributes);
+  record.SetHandleCount(objBasicInfo.HandleCount);
+
+  // We query the ObjectTypeInformation to accommodate the potential
+  // handle reuse case, but also on pre-Win8 systems we would not have had
+  // access to type information in the initial enumeration.
+  objTypeInfo = {0};
+  ntStatus = NtQueryObject(duplicatedObjectHandle,
+                           ObjectTypeInformation,
+                           &objTypeInfo,
+                           sizeof(objTypeInfo),
+                           &retLen);
+
+  if (!NT_SUCCESS(ntStatus)) {
+    // If unsuccessful, log the error and move on, we will
+    // have a chance to recover at row generation by checking the type index
+    // mapping against the cache
+    record.SetError(ErrorStage::ObjectTypeInfoQuerying,
+                    RtlNtStatusToDosError(ntStatus));
+    VLOG(1) << "Error (0x" << std::hex << ntStatus << std::dec
+            << ") querying type info for PID: " << record.Pid()
+            << " | Handle: 0x" << std::hex << record.Handle() << std::dec;
+    return;
+  }
+  record.SetObjectTypeName(&objTypeInfo.TypeInfo.TypeName);
+
+  // Attempt to resolve the object name
+  ResolveObjectName(record,
+                    duplicatedObjectHandle,
+                    objTypeInfo.TypeInfo.TypeName,
+                    fileTypeName,
+                    params);
+}
+
+// Parent class that holds the state of handle enumeration,
+// including the cache, the list of PIDs to filter on, and the resulting handle
+// records that will be converted to rows for output.
+class HandleEnumeration {
+ public:
+  HandleRecordCache m_cache;
+  std::set<int> m_pidlist;
+  std::vector<HandleRecordPtr> handleRecords;
+
+  HandleEnumeration(const std::set<int>& pidlist) : m_pidlist(pidlist) {}
+
+  bool IsPidFiltered(DWORD pid) const {
+    return !m_pidlist.empty() &&
+           m_pidlist.find(static_cast<int>(pid)) == m_pidlist.end();
+  }
+
+  HandleRecordCache& Cache() {
+    return m_cache;
+  }
+
+  QueryData ToRows() {
+    QueryData rows;
+    for (const auto& handle : handleRecords) {
+      rows.push_back(handle->ToRow());
+    }
+    return rows;
+  }
+
+  // Get handle enumeration and a minimal type mapping.
+  NTSTATUS
+  GetHandleAndTypeEnumeration() {
+    NTSTATUS ntStatus = STATUS_SUCCESS;
+    PSYSTEM_HANDLE_INFORMATION_EX pHandleInfo = nullptr;
+    ULONG retLen = 0;
+
+    std::vector<uint8_t> localBuffer(INITIAL_ENUMERATION_BUFFER_SIZE);
+
+    // 1. Acquire the type enumeration if supported.
+    ntStatus = GetObjectTypeEnumeration(m_cache);
+    if (STATUS_SUCCESS != ntStatus && STATUS_NOT_SUPPORTED != ntStatus) {
+      VLOG(1) << "Failed to query object type enumeration: 0x" << std::hex
+              << ntStatus << std::dec;
+      return ntStatus;
+    }
+
+    // 2. Query handles
+    ntStatus = NtQuerySystemInformation(SystemExtendedHandleInformation,
+                                        localBuffer.data(),
+                                        static_cast<ULONG>(localBuffer.size()),
+                                        &retLen);
+
+    if (STATUS_INFO_LENGTH_MISMATCH == ntStatus) {
+      // We assume that the quantity of handles won't more than double between
+      // our calls, on typical system we'll be expecting on the order of 10s of
+      // thousands of handles
+      size_t newSize = static_cast<size_t>(retLen) * 2;
+      if ((newSize > MAXIMUM_ENUMERATION_BUFFER_SIZE) ||
+          (newSize > ULONG_MAX)) {
+        return STATUS_BUFFER_TOO_SMALL;
+      }
+      localBuffer.resize(newSize);
+      ntStatus = NtQuerySystemInformation(SystemExtendedHandleInformation,
+                                          localBuffer.data(),
+                                          static_cast<ULONG>(newSize),
+                                          &retLen);
+    }
+
+    if (STATUS_SUCCESS != ntStatus) {
+      VLOG(1) << "Failed to query system handle information: 0x" << std::hex
+              << ntStatus << std::dec;
+      return ntStatus;
+    }
+
+    // Filter and process the basic enumeration into our record structure
+    pHandleInfo =
+        reinterpret_cast<PSYSTEM_HANDLE_INFORMATION_EX>(localBuffer.data());
+    for (ULONG i = 0; i < pHandleInfo->NumberOfHandles; i++) {
+      PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX entry = &pHandleInfo->Handles[i];
+      if (IsPidFiltered(static_cast<DWORD>(entry->UniqueProcessId))) {
+        continue;
+      }
+      handleRecords.emplace_back(
+          std::make_unique<HandleRecord>(entry, m_cache));
+    }
+
+    return STATUS_SUCCESS;
+  }
+
+  // Enumerate and enrich all handle records not excluded by our PID filter
+  // including error handling and mitigations for potential blocking calls
+  // when querying object names.
+  DWORD
+  EnumerateAllHandles() {
+    NTSTATUS ntStatus = STATUS_SUCCESS;
+    UNICODE_STRING fileTypeName = {0};
+    std::unordered_map<ULONG_PTR, DWORD> failedPIDErrors;
+    std::unordered_map<ULONG_PTR, ScopedHandle> processHandleCache;
+
+    // Acquire the enumerations.
+    ntStatus = GetHandleAndTypeEnumeration();
+    if (STATUS_SUCCESS != ntStatus) {
+      DWORD dwStatus = RtlNtStatusToDosError(ntStatus);
+      VLOG(1) << "Failed to query system handle information / type mapping: 0x"
+              << std::hex << dwStatus << std::dec;
+      return dwStatus;
+    }
+
+    // We need the File type name as a special case for the mapping technique in
+    // object name resolution we initialize it here to avoid unnecessary stack
+    // allocation in the inner loop of name resolution
+    RtlInitUnicodeString(&fileTypeName, L"File");
+
+    // Allocate these outside of the loop to avoid unnecessary stack allocation
+    // on each iteration
+    OBJECT_TYPE_INFORMATION_WITH_STORAGE objTypeInfo = {0};
+    QUERY_OBJECT_NAME_PARAMS params = {0};
+    OBJECT_BASIC_INFORMATION objBasicInfo = {0};
+
+    // Enrich Handle records
+    for (auto& handleIter : handleRecords) {
+      // Aquire the Process Handle for this record, using caches to avoid
+      // redundant OpenProcess calls on the same PID
+      HANDLE processHandle = AcquireProcessHandle(
+          *handleIter, failedPIDErrors, processHandleCache);
+      if (INVALID_HANDLE_VALUE == processHandle) {
+        continue;
+      }
+
+      // Enrich the record with the duplicated handle's information,
+      // including querying the name with potential blocking mitigations
+      // for File objects
+      EnrichHandleRecord(*handleIter,
+                         processHandle,
+                         fileTypeName,
+                         objBasicInfo,
+                         objTypeInfo,
+                         params);
+    }
+    return ERROR_SUCCESS;
+  }
+};
 
 } // namespace handles
 
+// osquery table entry point for the "handles" table.
+// If no pid constraint is provided, defaults to the current (osquery)
+// process.  Requires SeDebugPrivilege for cross-process enumeration.
 QueryData genHandles(QueryContext& context) {
   QueryData results;
   std::set<int> pidlist;
@@ -1214,18 +1288,19 @@ QueryData genHandles(QueryContext& context) {
   }
 
   if (pidlist.empty()) {
-    LOG(INFO) << "No process ID constraint found, using current process ID: " << GetCurrentProcessId();
+    VLOG(1) << "No process ID constraint found, using current process ID: "
+            << GetCurrentProcessId();
     pidlist.insert(GetCurrentProcessId());
   }
 
   handles::HandleEnumeration handleEnumeration(pidlist);
   if (ERROR_SUCCESS != handles::SetDebugTokenPrivilege()) {
-    LOG(ERROR) << "Failed to set debug token privilege.";
+    VLOG(1) << "Failed to set debug token privilege.";
     return results;
   }
 
-  if (ERROR_SUCCESS != handles::EnumerateAllHandles(pidlist, handleEnumeration, false)) {
-    LOG(ERROR) << "Failed to enumerate all handles.";
+  if (ERROR_SUCCESS != handleEnumeration.EnumerateAllHandles()) {
+    VLOG(1) << "Failed to enumerate all handles.";
     return results;
   }
 
