@@ -882,7 +882,6 @@ HANDLE AcquireProcessHandle(
   // cache the handle so that we don't have to open it again
   // for another handle from the same PID
   processHandleCache.try_emplace(record.Pid(), processHandle);
-  }
 
   return processHandle;
 }
