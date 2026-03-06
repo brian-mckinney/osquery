@@ -842,18 +842,27 @@ HANDLE AcquireProcessHandle(
     std::unordered_map<ULONG_PTR, ScopedHandle>& processHandleCache) {
   HANDLE processHandle = INVALID_HANDLE_VALUE;
 
-  // Open the source process
+  // Check the failedPiDErrors cache to see if we've already attempted and
+  // failed to open a handle to this PID. If so, we can skip the attempt and
+  // directly set the error on the record. This is important to avoid repeated
+  // failed attempts on the same PID which can happen with many handles from the
+  // same process
   auto failedPidIt = failedPIDErrors.find(record.Pid());
   if (failedPidIt != failedPIDErrors.end()) {
     record.SetError(ErrorStage::ProcessOpening, failedPidIt->second);
     return INVALID_HANDLE_VALUE;
   }
 
+  // Check the processHandleCache to see if we already have a handle (successful
+  // or failed) for this PID.  If so, use it.
   DWORD openProcessError = ERROR_SUCCESS;
   auto cachedHandleIt = processHandleCache.find(record.Pid());
   if (cachedHandleIt != processHandleCache.end()) {
     processHandle = cachedHandleIt->second.get();
   } else {
+    // Attempt to open a handle to the process for duplication.
+    // We need PROCESS_DUP_HANDLE access right to be able to duplicate handles
+    // from it.
     processHandle = OpenProcess(PROCESS_DUP_HANDLE, FALSE, record.Pid());
     openProcessError = GetLastError();
     // cache the handle to avoid repeated attempts on the same PID
@@ -861,10 +870,18 @@ HANDLE AcquireProcessHandle(
     processHandleCache.try_emplace(record.Pid(), processHandle);
   }
 
+  // If we failed to open a handle to the process, cache this failure in
+  // failedPIDErrors and set the error on the record.
   if (NULL == processHandle || INVALID_HANDLE_VALUE == processHandle) {
+    openProcessError = GetLastError();
     record.SetError(ErrorStage::ProcessOpening, openProcessError);
     failedPIDErrors.insert({record.Pid(), openProcessError});
     return INVALID_HANDLE_VALUE;
+  }
+
+  // cache the handle so that we don't have to open it again
+  // for another handle from the same PID
+  processHandleCache.try_emplace(record.Pid(), processHandle);
   }
 
   return processHandle;
@@ -947,6 +964,10 @@ void ResolveObjectName(HandleRecord& record,
           << params.ntStatus << std::dec << " for PID: " << record.Pid()
           << " | Handle : 0x" << std::hex << record.Handle() << std::dec;
 
+  // Mapping technique failed, we will continue with the thread fallback only if
+  // the user has explicitly accepted the risk of potential hangs by enabling
+  // FLAGS_allow_handle_threads. Otherwise we will record the mapping error and
+  // return.
   if (!FLAGS_allow_handle_threads) {
     // Mapping technique failed and thread fallback is disabled (the default).
     // NtQueryObject risks blocking indefinitely.  Record the mapping error 
@@ -992,6 +1013,8 @@ void ResolveObjectName(HandleRecord& record,
                        0,
                        NULL);
 
+  // If we failed to create the thread, we won't be able to query the name, so
+  // log the error and return.
   if (!NT_SUCCESS(ntThreadStatus) || NULL == hThread) {
     record.SetError(ErrorStage::ObjectNameQuerying,
                     NT_SUCCESS(ntThreadStatus)
@@ -1001,6 +1024,8 @@ void ResolveObjectName(HandleRecord& record,
     return;
   }
 
+  // Wait for the thread to complete with a timeout.  If the wait fails or times
+  // out, we will proceed to hard-terminate the thread.
   ScopedHandle threadHandle(hThread);
   switch (WaitForSingleObject(hThread, 500)) {
   case WAIT_OBJECT_0:
@@ -1037,10 +1062,14 @@ void ResolveObjectName(HandleRecord& record,
 
 /// Duplicate a handle from the target process and query its basic info,
 /// type, and name.  Results are written into the HandleRecord.
-///
-/// objBasicInfo, objTypeInfo, and params are caller-owned reusable buffers
-/// passed in to avoid per-handle stack allocation.  They are zeroed and
-/// repopulated on each call.
+/// record is the HandleRecord to enrich with queried information about the
+/// handle processHandle is a handle to the process that owns the handle, used
+/// for duplication fileTypeName is a preallocated unicode string for "File"
+/// type, used to identify file objects objBasicInfo is a preallocated buffer
+/// for OBJECT_BASIC_INFORMATION queries to avoid heap allocations in this
+/// function objTypeInfo is a preallocated buffer for OBJECT_TYPE_INFORMATION
+/// queries to avoid heap allocations in this function params is a preallocated
+/// struct for querying object names to avoid heap allocations in this function
 void EnrichHandleRecord(
     HandleRecord& record,
     HANDLE processHandle,
@@ -1052,10 +1081,7 @@ void EnrichHandleRecord(
   HANDLE duplicatedObjectHandle = INVALID_HANDLE_VALUE;
 
   // Try duplicating with GENERIC_READ first because the mapping technique
-  // (NtCreateSection) requires read access to the file handle.  If the
-  // source process's handle doesn't grant read, we fall back to a
-  // zero-access duplicate which is sufficient for NtQueryObject but cannot
-  // use the mapping technique.
+  // (NtCreateSection) requires read access to the file handle.
   ntStatus = NtDuplicateObject(processHandle,
                                record.Handle(),
                                GetCurrentProcess(),
@@ -1064,6 +1090,9 @@ void EnrichHandleRecord(
                                0,
                                0);
 
+  // If the source process's handle doesn't grant read, we fall back to a
+  // zero-access duplicate which is sufficient for NtQueryObject but cannot
+  // use the mapping technique.
   if (STATUS_ACCESS_DENIED == ntStatus) {
     ntStatus = NtDuplicateObject(processHandle,
                                  record.Handle(),
@@ -1258,13 +1287,14 @@ class HandleEnumeration {
       return dwStatus;
     }
 
-    // We need the File type name as a special case for object name
-    // resolution we initialize it here to avoid unnecessary stack
+    // We need the File type name as a special case for the mapping technique in
+    // object name resolution.  We initialize it here to avoid unnecessary stack
     // allocation in the inner loop of name resolution
     RtlInitUnicodeString(&fileTypeName, L"File");
 
-    // Allocate these outside of the loop to avoid unnecessary stack allocation
-    // on each iteration
+    // Each loop iteration needs these structures, but we want to avoid
+    // per-iteration stack allocation The enrichment function will zero and
+    // repopulate them on each call
     OBJECT_TYPE_INFORMATION_WITH_STORAGE objTypeInfo = {0};
     QUERY_OBJECT_NAME_PARAMS params = {0};
     OBJECT_BASIC_INFORMATION objBasicInfo = {0};
@@ -1302,6 +1332,8 @@ QueryData genHandles(QueryContext& context) {
   QueryData results;
   std::set<int> pidlist;
 
+  // Determine pid constraints, if any. If no PID constraints are provided,
+  // we will default to enumerating handles for the current process.
   if (context.constraints.count("pid") > 0 && context.constraints.at("pid").exists(EQUALS)) {
     for (const auto& pid : context.constraints.at("pid").getAll<int>(EQUALS)) {
       pidlist.insert(pid);
@@ -1314,17 +1346,21 @@ QueryData genHandles(QueryContext& context) {
     pidlist.insert(GetCurrentProcessId());
   }
 
+  // Construct the handle enumeration object which will manage the state of our
+  // enumeration and caching
   handles::HandleEnumeration handleEnumeration(pidlist);
   if (ERROR_SUCCESS != handles::SetDebugTokenPrivilege()) {
     VLOG(1) << "Failed to set debug token privilege.";
     return results;
   }
 
+  // Perform the enumeration and enrichment of handle records
   if (ERROR_SUCCESS != handleEnumeration.EnumerateAllHandles()) {
     VLOG(1) << "Failed to enumerate all handles.";
     return results;
   }
 
+  // Convert the resulting handle records to rows for output
   results = handleEnumeration.ToRows();
 
   return results;

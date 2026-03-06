@@ -8,9 +8,9 @@
  */
 
 #pragma once
+
 #include <osquery/utils/system/system.h>
 #include <winternl.h>
-
 namespace osquery {
 
 #ifndef STATUS_SUCCESS
