@@ -8,7 +8,7 @@ schema([
     Column("name", TEXT, "The value of the object referenced by the handle."),
     Column("attributes", TEXT, "Object handle attributes."),
     Column("handle_count", BIGINT, "Handle Count."),
-    Column("raw_pointer_count", BIGINT, "Raw Pointer Count."),
+    Column("raw_pointer_count", BIGINT, "Raw Pointer/Reference Count. Meaning varies, consult Windows docs."),
     Column("error_stage", TEXT, "Error Stage."),
     Column("error_code", BIGINT, "Error Code.")
 ])

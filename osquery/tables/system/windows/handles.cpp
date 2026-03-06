@@ -842,7 +842,7 @@ HANDLE AcquireProcessHandle(
     std::unordered_map<ULONG_PTR, ScopedHandle>& processHandleCache) {
   HANDLE processHandle = INVALID_HANDLE_VALUE;
 
-  // 2a. Open the source process
+  // Open the source process
   auto failedPidIt = failedPIDErrors.find(record.Pid());
   if (failedPidIt != failedPIDErrors.end()) {
     record.SetError(ErrorStage::ProcessOpening, failedPidIt->second);
@@ -856,8 +856,8 @@ HANDLE AcquireProcessHandle(
   } else {
     processHandle = OpenProcess(PROCESS_DUP_HANDLE, FALSE, record.Pid());
     openProcessError = GetLastError();
-    // cache the handle (including failures) to avoid repeated attempts on the
-    // same PID which can happen with many handles from the same process
+    // cache the handle to avoid repeated attempts on the same PID
+    // which can happen with many handles from the same process
     processHandleCache.try_emplace(record.Pid(), processHandle);
   }
 
@@ -949,14 +949,35 @@ void ResolveObjectName(HandleRecord& record,
 
   if (!FLAGS_allow_handle_threads) {
     // Mapping technique failed and thread fallback is disabled (the default).
-    // We cannot safely resolve this name — NtQueryObject could block
-    // indefinitely.  Record the mapping error and leave the name unresolved.
+    // NtQueryObject risks blocking indefinitely.  Record the mapping error 
+    // and leave the name unresolved.
     record.SetError(ErrorStage::ObjectNameMapping,
                     RtlNtStatusToDosError(params.ntStatus),
                     true);
     return;
   }
 
+  // This thread technique is believed to be as safe as we can make it given present Windows
+  // behaviors.  We use  NtCreateThreadEx(...,THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH, ...)
+  // to attempt to ensure no per thread locking, ref counting, or allocations are caused in user mode 
+  // that might not get an opportunity to be cleaned if we have to use NtTerminateThread().
+  // The cases we consider:
+  // 1. The thread immediately successfully resolves the object name and terminates itself normally.
+  //     This occurs in nearly all cases.
+  // 2. The File object has a synchronous IO operation waiting and our thread blocks in kernel
+  //     attempting to acquire the file object lock.  This occurs only a handful of times on a normal
+  //     full system enumeration.  We then use NtTerminateThread(), which queues an APC to the thread
+  //     and also satisfies the kernel alertable KeWaitForSingleObject() the thread is blocked in.  The 
+  //     alerted thread returns through functions resolving object Busy markers and locks correctly
+  //     before arriving at a check for the pending APC that got queued.  It finds the APC and terminates
+  //     the thread (freeing all kernel associated resources as well as the user mode thread stack).  This
+  //     leaves the state of the process as it was before the thread.
+  // 3. Something unexpected occurs.  A future version of Windows changes some of the undocumented
+  //     behavior, or a 3rd party security solution involves itself in the sequence of thread events, or something
+  //     else unforeseen occurs and the termination of the thread(s) leak resources (failure to free memory, 
+  //     decrement a ref count somewhere, or release a lock) put the process in a bad state that does not
+  //     resolve until it is restarted.  We're not presently aware of a way this occurs, we're simply highlighting
+  //     the risk.
   HANDLE hThread = NULL;
   NTSTATUS ntThreadStatus =
       NtCreateThreadEx(&hThread,
@@ -1203,7 +1224,7 @@ class HandleEnumeration {
       return ntStatus;
     }
 
-    // Filter and process the basic enumeration into our record structure
+    // 3. Filter and process the basic enumeration into our record structure
     pHandleInfo =
         reinterpret_cast<PSYSTEM_HANDLE_INFORMATION_EX>(localBuffer.data());
     for (ULONG i = 0; i < pHandleInfo->NumberOfHandles; i++) {
@@ -1237,8 +1258,8 @@ class HandleEnumeration {
       return dwStatus;
     }
 
-    // We need the File type name as a special case for the mapping technique in
-    // object name resolution we initialize it here to avoid unnecessary stack
+    // We need the File type name as a special case for object name
+    // resolution we initialize it here to avoid unnecessary stack
     // allocation in the inner loop of name resolution
     RtlInitUnicodeString(&fileTypeName, L"File");
 
