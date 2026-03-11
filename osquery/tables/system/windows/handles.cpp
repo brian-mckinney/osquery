@@ -8,7 +8,6 @@
  */
 #include <windows.h>
 
-#include <iomanip>
 #include <map>
 #include <set>
 #include <string>
@@ -20,6 +19,7 @@
 #include <osquery/logger/logger.h>
 #include <osquery/sql/dynamic_table_row.h>
 #include <osquery/sql/sql.h>
+#include <osquery/tables/system/windows/token_privileges.h>
 #include <osquery/utils/conversions/windows/strings.h>
 
 // Link against ntdll.lib directly to access NT Native API functions
@@ -660,47 +660,6 @@ struct HandleCloser {
 };
 using ScopedHandle = std::unique_ptr<void, HandleCloser>;
 
-// Helper function to set the SeDebugPrivilege for the current process,
-// which allows us to query handles from processes we don't own.
-// We attempt to set this privilege at the start of enumeration,
-// and if it fails we log the error but continue on with enumeration
-// since we may still be able to query handles from some processes
-//
-DWORD
-SetDebugTokenPrivilege() {
-  HANDLE hToken = NULL;
-  TOKEN_PRIVILEGES tp = {0};
-  LUID val = {0};
-
-  if (!OpenProcessToken(GetCurrentProcess(),
-                        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                        &hToken)) {
-    return GetLastError();
-  }
-
-  auto scopedToken = ScopedHandle(hToken);
-
-  if (!LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &val)) {
-    return GetLastError();
-  }
-
-  tp.PrivilegeCount = 1;
-  tp.Privileges[0].Luid = val;
-  tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-  if (!AdjustTokenPrivileges(hToken, FALSE, &tp, 0, NULL, NULL)) {
-    return GetLastError();
-  }
-
-  // AdjustTokenPrivileges can succeed but set LastError to
-  // ERROR_NOT_ALL_ASSIGNED if our token doesn't have this privilege.
-  if (ERROR_NOT_ALL_ASSIGNED == GetLastError()) {
-    return ERROR_NOT_ALL_ASSIGNED;
-  }
-
-  return ERROR_SUCCESS;
-}
-
 // Thread function for querying an object's name via NtQueryObject.
 // This thread may be terminated via TerminateThread if NtQueryObject blocks
 // on a synchronous file handle (named pipe, console, etc.).  Because
@@ -855,32 +814,27 @@ HANDLE AcquireProcessHandle(
 
   // Check the processHandleCache to see if we already have a handle (successful
   // or failed) for this PID.  If so, use it.
-  DWORD openProcessError = ERROR_SUCCESS;
   auto cachedHandleIt = processHandleCache.find(record.Pid());
   if (cachedHandleIt != processHandleCache.end()) {
-    processHandle = cachedHandleIt->second.get();
-  } else {
-    // Attempt to open a handle to the process for duplication.
-    // We need PROCESS_DUP_HANDLE access right to be able to duplicate handles
-    // from it.
-    processHandle = OpenProcess(PROCESS_DUP_HANDLE, FALSE, record.Pid());
-    openProcessError = GetLastError();
-    // cache the handle to avoid repeated attempts on the same PID
-    // which can happen with many handles from the same process
-    processHandleCache.try_emplace(record.Pid(), processHandle);
+    return cachedHandleIt->second.get();
   }
+
+  // Attempt to open a handle to the process for duplication.
+  // We need PROCESS_DUP_HANDLE access right to be able to duplicate handles
+  // from it.
+  processHandle = OpenProcess(PROCESS_DUP_HANDLE, FALSE, record.Pid());
 
   // If we failed to open a handle to the process, cache this failure in
   // failedPIDErrors and set the error on the record.
   if (NULL == processHandle || INVALID_HANDLE_VALUE == processHandle) {
-    openProcessError = GetLastError();
+    DWORD openProcessError = GetLastError();
     record.SetError(ErrorStage::ProcessOpening, openProcessError);
     failedPIDErrors.insert({record.Pid(), openProcessError});
     return INVALID_HANDLE_VALUE;
   }
 
-  // cache the handle so that we don't have to open it again
-  // for another handle from the same PID
+  // cache the handle to avoid repeated attempts on the same PID
+  // which can happen with many handles from the same process
   processHandleCache.try_emplace(record.Pid(), processHandle);
 
   return processHandle;
@@ -923,7 +877,8 @@ void ResolveObjectName(HandleRecord& record,
       break;
     }
 
-    if (!NT_SUCCESS(params.ntStatus)) {
+    if (!NT_SUCCESS(params.ntStatus) &&
+        record.GetErrorStage() == ErrorStage::None) {
       record.SetError(ErrorStage::ObjectNameQuerying,
                       RtlNtStatusToDosError(params.ntStatus),
                       true);
@@ -981,23 +936,15 @@ void ResolveObjectName(HandleRecord& record,
   // behaviors.  We use  NtCreateThreadEx(...,THREAD_CREATE_FLAGS_SKIP_THREAD_ATTACH, ...)
   // to attempt to ensure no per thread locking, ref counting, or allocations are caused in user mode 
   // that might not get an opportunity to be cleaned if we have to use NtTerminateThread().
-  // The cases we consider:
-  // 1. The thread immediately successfully resolves the object name and terminates itself normally.
-  //     This occurs in nearly all cases.
-  // 2. The File object has a synchronous IO operation waiting and our thread blocks in kernel
-  //     attempting to acquire the file object lock.  This occurs only a handful of times on a normal
-  //     full system enumeration.  We then use NtTerminateThread(), which queues an APC to the thread
-  //     and also satisfies the kernel alertable KeWaitForSingleObject() the thread is blocked in.  The 
-  //     alerted thread returns through functions resolving object Busy markers and locks correctly
-  //     before arriving at a check for the pending APC that got queued.  It finds the APC and terminates
-  //     the thread (freeing all kernel associated resources as well as the user mode thread stack).  This
-  //     leaves the state of the process as it was before the thread.
-  // 3. Something unexpected occurs.  A future version of Windows changes some of the undocumented
-  //     behavior, or a 3rd party security solution involves itself in the sequence of thread events, or something
-  //     else unforeseen occurs and the termination of the thread(s) leak resources (failure to free memory, 
-  //     decrement a ref count somewhere, or release a lock) put the process in a bad state that does not
-  //     resolve until it is restarted.  We're not presently aware of a way this occurs, we're simply highlighting
-  //     the risk.
+
+  // Thread fallback poses a risk because we may need TerminateThread`
+  // if `NtQueryObject` blocks on synchronous File handles.
+  // We mitigate risk by:
+  // 1) creating a minimal worker (`SKIP_THREAD_ATTACH`),
+  // 2) bounding wait time (500ms),
+  // 3) forcing thread exit only on timeout/failure.
+  // 4) thread fallback is excplicitly opt-in via FLAGS_allow_handle_threads
+  // (default is disabled)
   HANDLE hThread = NULL;
   NTSTATUS ntThreadStatus =
       NtCreateThreadEx(&hThread,
@@ -1059,16 +1006,7 @@ void ResolveObjectName(HandleRecord& record,
   updateRecordWithNameResult();
 }
 
-/// Duplicate a handle from the target process and query its basic info,
-/// type, and name.  Results are written into the HandleRecord.
-/// record is the HandleRecord to enrich with queried information about the
-/// handle processHandle is a handle to the process that owns the handle, used
-/// for duplication fileTypeName is a preallocated unicode string for "File"
-/// type, used to identify file objects objBasicInfo is a preallocated buffer
-/// for OBJECT_BASIC_INFORMATION queries to avoid heap allocations in this
-/// function objTypeInfo is a preallocated buffer for OBJECT_TYPE_INFORMATION
-/// queries to avoid heap allocations in this function params is a preallocated
-/// struct for querying object names to avoid heap allocations in this function
+/// Populate record with duplicated-handle metadata (basic info, type, name).
 void EnrichHandleRecord(
     HandleRecord& record,
     HANDLE processHandle,
@@ -1328,7 +1266,6 @@ class HandleEnumeration {
 // If no pid constraint is provided, defaults to the current (osquery)
 // process.  Requires SeDebugPrivilege for cross-process enumeration.
 QueryData genHandles(QueryContext& context) {
-  QueryData results;
   std::set<int> pidlist;
 
   // Determine pid constraints, if any. If no PID constraints are provided,
@@ -1347,22 +1284,22 @@ QueryData genHandles(QueryContext& context) {
 
   // Construct the handle enumeration object which will manage the state of our
   // enumeration and caching
-  handles::HandleEnumeration handleEnumeration(pidlist);
-  if (ERROR_SUCCESS != handles::SetDebugTokenPrivilege()) {
-    VLOG(1) << "Failed to set debug token privilege.";
-    return results;
+  SeDebugPrivilegeGuard debugPrivilegeGuard;
+  if (!debugPrivilegeGuard.privilegeEnabled()) {
+    VLOG(1) << "Failed to set debug token privilege. Handle enumeration may be "
+               "incomplete for processes we don't own";
   }
 
   // Perform the enumeration and enrichment of handle records
+  handles::HandleEnumeration handleEnumeration(pidlist);
   if (ERROR_SUCCESS != handleEnumeration.EnumerateAllHandles()) {
     VLOG(1) << "Failed to enumerate all handles.";
-    return results;
+    return QueryData();
   }
 
   // Convert the resulting handle records to rows for output
-  results = handleEnumeration.ToRows();
-
-  return results;
+  return handleEnumeration.ToRows();
 }
+
 } // namespace tables
 } // namespace osquery
