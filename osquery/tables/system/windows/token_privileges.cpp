@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include <osquery/core/shutdown.h>
 #include <osquery/logger/logger.h>
 #include <osquery/tables/system/windows/token_privileges.h>
 
@@ -153,8 +154,10 @@ SeDebugPrivilegeGuard::~SeDebugPrivilegeGuard() noexcept {
 
   // TODO: Should this be an exit failure instead of just a log message?
   if (!setDebugTokenPrivilege(m_original_state)) {
-    LOG(ERROR) << "Failed to restore debug token privilege to original state: "
-               << GetLastError() << ". SeDebugPrivilege may remain elevated.";
+    requestShutdown(
+        EXIT_CATASTROPHIC,
+        "Failed to restore debug token privilege to original state. "
+        "Shutting down to prevent potential security risk.");
   }
 }
 
