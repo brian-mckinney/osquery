@@ -312,6 +312,7 @@ function(generateNativeTables)
     "windows/tpm_info.table:windows"
     "windows/security_profile_info.table:windows"
     "windows/windows_search.table:windows"
+    "windows/windows_license_information.table:windows"
   )
 
   if(OSQUERY_BUILD_BPF)

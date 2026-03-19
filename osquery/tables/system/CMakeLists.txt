@@ -226,6 +226,7 @@ function(generateOsqueryTablesSystemSystemtable)
       windows/windows_eventlog.cpp
       windows/windows_optional_features.cpp
       windows/recent_files.cpp
+      windows/windows_license_information.cpp
       windows/windows_search.cpp
       windows/windows_security_products.cpp
       windows/windows_security_center.cpp
