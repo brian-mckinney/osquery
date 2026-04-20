@@ -1,0 +1,22 @@
+table_name("windows_license_information")
+description("Lists Windows License Information.")
+schema([
+    Column("application_id", TEXT, "Unique GUID identifying the application"),
+    Column("name", TEXT, "Short display name of the software product"),
+    Column("description", TEXT, "Detailed licensing description"),
+    Column("license_family", TEXT, "The group or category the license belongs to"),
+    Column("license_status", TEXT, "Human-readable activation state"),
+    Column("license_status_raw", INTEGER, "Numeric WMI value for license_status"),
+    Column("grace_period_remaining", INTEGER, "The time remaining before the product requires activation or expires."),
+    Column("genuine_status", INTEGER, "Validation check result: 1 if the produce passes Microsoft Validation checks; 0 if it fails."),
+    Column("partial_product_key", TEXT, "Last 5 characters of the product key"),
+    Column("product_key_channel", TEXT, "Product key channel."),
+    Column("trusted_time", BIGINT, "System timestamp when the product was last verified"),
+    Column("license_id", TEXT, "License ID."),
+    Column("ad_activation_object_name", TEXT, "The name of the Active Directory object used for AD-Based Activation"),
+    Column("ad_activation_object_dn", TEXT, "The Distinguished Name of the AD activation object."),
+])
+implementation("windows_license_information@genWindowsLicenseInformation")
+examples([
+  "select * from windows_license_information",
+])
